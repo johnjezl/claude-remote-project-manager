@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Remote Control project manager (registers ~/projects with claude remote-control)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/crpm daemon
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+# Only kill the daemon itself on stop/restart. The tmux server (and the
+# remote-control servers inside it) keep running and are re-adopted on start.
+# Use `crpm stop-all` to tear them down.
+KillMode=process
+
+[Install]
+WantedBy=default.target

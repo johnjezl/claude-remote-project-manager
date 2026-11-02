@@ -1,0 +1,22 @@
+# ~/.config/crpm/config.toml  -- every key is optional; defaults shown.
+
+projects_dir     = "~/projects"
+poll_interval    = 5          # seconds between scans of projects_dir
+settle_seconds   = 15         # a new folder must exist this long first (lets `git clone` finish)
+exclude          = [".*", "_*"]   # folder-name globs to ignore
+
+tmux_socket      = "crpm"     # dedicated tmux server:  tmux -L crpm ls
+session_prefix   = "rc-"      # tmux session = rc-<project>
+
+claude_bin       = "claude"
+spawn_mode       = "worktree" # git repos: each remote session gets its own worktree
+non_git          = "same-dir" # folders without .git: "same-dir" or "skip"
+auto_trust       = true       # answer the first-run "Trust <folder>? [y/N]" prompt with y
+permission_mode  = ""         # e.g. "acceptEdits" / "plan"; "" = claude default
+capacity         = 0          # max concurrent sessions per project; 0 = claude default (32)
+create_session_in_dir = true  # pre-create one session in the main checkout
+name_prefix      = ""         # prefix for auto-generated session names; "" = hostname
+extra_args       = []         # appended to `claude remote-control`
+
+restart_backoff  = [5, 15, 60, 300]   # seconds, after successive crashes
+stop_timeout     = 10
