@@ -11,7 +11,17 @@ claude.ai/code or the Claude mobile app.
   Folders without `.git` fall back to `--spawn same-dir` (or are skipped; see config).
   If such a folder later becomes a git repo, crpm restarts it in worktree mode.
 * **De-registration.** Delete or move a folder out of `~/projects` and crpm stops
-  its server (Ctrl-C first, then kill after `stop_timeout`).
+  its server (Ctrl-C first, then kill after `stop_timeout`). Servers run with
+  `--no-create-session-in-dir`, so on stop Claude Code deletes the remote from
+  claude.ai/code and archives its sessions instead of leaving it listed offline.
+  (With `create_session_in_dir = true` you get a ready-made session in the main
+  checkout, but stopped remotes then linger in the UI.)
+* **Names.** Session names are prefixed with the project folder name
+  (`name_prefix = "{project}"`), e.g. `sd-mux-graceful-unicorn`, so the web UI
+  shows which project each session belongs to.
+* **Config changes apply automatically.** If a project's `claude remote-control`
+  command line would change (config edit, or a folder becoming a git repo), crpm
+  restarts that project's server.
 * **Self-healing.** A server that exits is restarted with backoff (5s → 15s → 60s → 300s).
 * **Trust prompt.** The first time `remote-control` runs in a folder it asks
   `Trust <folder>? [y/N]`. By default you answer it yourself, once per folder:

@@ -46,8 +46,13 @@ DEFAULTS = {
     "auto_trust": False,         # answer the first-run "Trust <folder>?" prompt with y (trusts everything in projects_dir)
     "permission_mode": "",       # e.g. "acceptEdits"; empty = claude default
     "capacity": 0,               # 0 = claude default (32)
-    "create_session_in_dir": True,
-    "name_prefix": "",           # prefix for auto-generated session names; empty = claude default (hostname)
+    # false = no pre-created session in the main checkout. This also makes remote-control
+    # delete its environment (the "remote" in claude.ai/code) and archive its sessions
+    # when it stops, so removed projects disappear from the UI instead of going stale.
+    "create_session_in_dir": False,
+    # prefix for auto-generated session names, so sessions show which project they
+    # belong to; "{project}" = folder name, "" = claude default (hostname)
+    "name_prefix": "{project}",
     "extra_args": [],
     "exclude": [".*", "_*"],     # glob patterns of folder names to ignore
     "restart_backoff": [5, 15, 60, 300],
@@ -75,16 +80,16 @@ class Tmux:
                               capture_output=True, text=True, check=check)
 
     def sessions(self, prefix: str) -> dict[str, dict]:
-        """Managed sessions -> {name: {path, mode}}."""
-        fmt = "#{session_name}\t#{@crpm_path}\t#{@crpm_mode}"
+        """Managed sessions -> {name: {path, mode, cmd}}."""
+        fmt = "#{session_name}\t#{@crpm_path}\t#{@crpm_mode}\t#{@crpm_cmd}"
         r = self.run("list-sessions", "-F", fmt)
         out = {}
         if r.returncode != 0:  # no server running
             return out
         for line in r.stdout.splitlines():
-            name, path, mode = (line.split("\t") + ["", ""])[:3]
+            name, path, mode, cmd = (line.split("\t") + ["", "", ""])[:4]
             if name.startswith(prefix):
-                out[name] = {"path": path, "mode": mode}
+                out[name] = {"path": path, "mode": mode, "cmd": cmd}
         return out
 
     def new_session(self, name: str, cwd: str, command: str, opts: dict[str, str]) -> bool:
@@ -107,6 +112,25 @@ class Tmux:
 
     def has(self, name: str) -> bool:
         return self.run("has-session", "-t", f"={name}").returncode == 0
+
+
+STATUS_LINE = re.compile(r"^·[^·\s]{1,3}· ([A-Z][a-z]+)", re.M)
+
+
+def screen_state(screen: str) -> str:
+    """Current state of a remote-control TUI from its pane text. The pane keeps
+    old output, so only the last status line / last non-blank line count."""
+    lines = [l for l in screen.splitlines() if l.strip()]
+    if lines and lines[-1].rstrip().endswith(("[y/N]", "[y/N] y")):
+        return "WAITING FOR TRUST PROMPT"
+    for line in reversed(lines):
+        if m := STATUS_LINE.match(line):
+            return m.group(1).lower()
+        if re.match(r"^\[[\d:]+\] Reconnected", line):
+            return "connected"
+        if re.match(r"^\[[\d:]+\] Reconnecting", line):
+            return "reconnecting"
+    return "starting/unknown"
 
 
 def session_name(prefix: str, project: str) -> str:
@@ -186,7 +210,7 @@ class Manager:
         if not c["create_session_in_dir"]:
             argv += ["--no-create-session-in-dir"]
         if c["name_prefix"]:
-            argv += ["--remote-control-session-name-prefix", c["name_prefix"]]
+            argv += ["--remote-control-session-name-prefix", c["name_prefix"].format(project=path.name)]
         argv += list(c["extra_args"])
         return shlex.join(argv)
 
@@ -198,7 +222,7 @@ class Manager:
         cmd = self.command_for(path, mode)
         log.info("register %s (%s, spawn=%s): %s", path.name, path, mode, cmd)
         ok = self.tmux.new_session(name, str(path), cmd,
-                                   {"@crpm_path": str(path), "@crpm_mode": mode})
+                                   {"@crpm_path": str(path), "@crpm_mode": mode, "@crpm_cmd": cmd})
         bo.started_at = time.time()
         if ok and self.cfg["auto_trust"]:
             self.trust_pending[name] = time.time() + 120
@@ -246,7 +270,7 @@ class Manager:
                     log.info("auto-trusting %s", path)
                     self.tmux.send(name, "y", "Enter")
                     self.prompt_seen[name] = now + 2  # don't re-answer before it redraws
-            elif "Connected" in screen:
+            elif screen_state(screen) in ("connected", "ready"):
                 self.trust_pending.pop(name, None)
                 self.prompt_seen.pop(name, None)
 
@@ -265,8 +289,9 @@ class Manager:
 
         for name, (path, mode) in sorted(want.items()):
             cur = have.get(name)
-            if cur and (cur["path"] != str(path) or cur["mode"] != mode):
-                log.info("%s changed (%s -> %s); restarting", name, cur, (path, mode))
+            if cur and (cur["path"] != str(path) or cur["cmd"] != self.command_for(path, mode)):
+                # folder became a git repo, or the config changed
+                log.info("%s settings changed; restarting with: %s", name, self.command_for(path, mode))
                 self.stop(name)
                 cur = None
             if cur is None:
@@ -317,12 +342,7 @@ def cmd_status(cfg: dict, _a) -> int:
         return 0
     for name, info in sorted(have.items()):
         screen = t.capture(name)
-        if "Connected" in screen:
-            state = "connected"
-        elif re.search(r"\[y/N\]", screen):
-            state = "WAITING FOR TRUST PROMPT"
-        else:
-            state = "starting/unknown"
+        state = screen_state(screen)
         cap = re.search(r"Capacity: (\d+/\d+)", screen)
         print(f"{name:40} {state:26} {cap.group(1) if cap else '':8} {info['mode']:9} {info['path']}")
     return 0

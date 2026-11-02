@@ -15,8 +15,10 @@ auto_trust       = false      # true = answer the first-run "Trust <folder>? [y/
                               # i.e. trust EVERY folder in projects_dir (its hooks, MCP servers, settings)
 permission_mode  = ""         # e.g. "acceptEdits" / "plan"; "" = claude default
 capacity         = 0          # max concurrent sessions per project; 0 = claude default (32)
-create_session_in_dir = true  # pre-create one session in the main checkout
-name_prefix      = ""         # prefix for auto-generated session names; "" = hostname
+create_session_in_dir = false # true = pre-create a session in the main checkout. Note: true also
+                              # makes remotes of removed projects linger (offline) in claude.ai/code;
+                              # false deletes the remote and archives its sessions on stop.
+name_prefix      = "{project}" # session-name prefix ({project} = folder name); "" = hostname
 extra_args       = []         # appended to `claude remote-control`
 
 restart_backoff  = [5, 15, 60, 300]   # seconds, after successive crashes
