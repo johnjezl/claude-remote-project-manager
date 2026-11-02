@@ -116,6 +116,9 @@ def session_name(prefix: str, project: str) -> str:
 
 # --------------------------------------------------------------------------- daemon
 
+TRUST_DELAY = 2.0
+
+
 @dataclass
 class Backoff:
     failures: int = 0
@@ -129,15 +132,19 @@ class Manager:
     tmux: Tmux = field(init=False)
     first_seen: dict[str, float] = field(default_factory=dict)
     backoff: dict[str, Backoff] = field(default_factory=dict)
-    trust_pending: dict[str, float] = field(default_factory=dict)
+    trust_pending: dict[str, float] = field(default_factory=dict)   # name -> give-up deadline
+    prompt_seen: dict[str, float] = field(default_factory=dict)     # name -> when prompt first seen
     stopping: bool = False
 
     def __post_init__(self):
         self.tmux = Tmux(self.cfg["tmux_socket"])
 
     # ---- discovery
-    def desired(self) -> dict[str, tuple[Path, str]]:
-        """{session_name: (project_path, spawn_mode)} for projects that should be registered."""
+    def desired(self, have: dict[str, dict]) -> dict[str, tuple[Path, str]]:
+        """{session_name: (project_path, spawn_mode)} for projects that should be registered.
+
+        The settle delay only gates *new* registrations; a folder that already
+        has a running session (e.g. adopted after a daemon restart) keeps it."""
         root: Path = self.cfg["projects_dir"]
         now = time.time()
         want: dict[str, tuple[Path, str]] = {}
@@ -153,8 +160,9 @@ class Manager:
             if any(fnmatch.fnmatch(p.name, pat) for pat in self.cfg["exclude"]):
                 continue
             seen.add(p.name)
+            sname = session_name(self.cfg["session_prefix"], p.name)
             self.first_seen.setdefault(p.name, now)
-            if now - self.first_seen[p.name] < self.cfg["settle_seconds"]:
+            if sname not in have and now - self.first_seen[p.name] < self.cfg["settle_seconds"]:
                 continue
             if (p / ".git").exists():
                 mode = self.cfg["spawn_mode"]
@@ -162,7 +170,7 @@ class Manager:
                 continue
             else:
                 mode = self.cfg["non_git"]
-            want[session_name(self.cfg["session_prefix"], p.name)] = (p.resolve(), mode)
+            want[sname] = (p.resolve(), mode)
         for gone in set(self.first_seen) - seen:
             del self.first_seen[gone]
         return want
@@ -192,7 +200,7 @@ class Manager:
                                    {"@crpm_path": str(path), "@crpm_mode": mode})
         bo.started_at = time.time()
         if ok and self.cfg["auto_trust"]:
-            self.trust_pending[name] = time.time() + 60
+            self.trust_pending[name] = time.time() + 120
         if not ok:
             self.note_failure(name)
 
@@ -215,26 +223,36 @@ class Manager:
                 self.tmux.kill(name)
         self.backoff.pop(name, None)
         self.trust_pending.pop(name, None)
+        self.prompt_seen.pop(name, None)
 
     def handle_trust_prompts(self, running: dict[str, dict]) -> None:
+        """Answer `Trust <path>? [y/N]` with y. Claude rejects answers that arrive
+        too quickly after the question, so wait TRUST_DELAY after first seeing the
+        prompt, and keep answering until the session reports Connected."""
         now = time.time()
         for name, deadline in list(self.trust_pending.items()):
             if name not in running or now > deadline:
-                del self.trust_pending[name]
+                if name in running:
+                    log.warning("%s: gave up waiting for trust prompt / connection", name)
+                self.trust_pending.pop(name, None)
+                self.prompt_seen.pop(name, None)
                 continue
             screen = self.tmux.capture(name)
             path = running[name]["path"]
-            if re.search(rf"Trust {re.escape(path)}\? \[y/N\]\s*$", screen, re.M):
-                log.info("auto-trusting %s", path)
-                self.tmux.send(name, "y", "Enter")
-                del self.trust_pending[name]
+            if re.search(rf"Trust {re.escape(path)}\? \[y/N\]\s*$", screen):
+                seen = self.prompt_seen.setdefault(name, now)
+                if now - seen >= TRUST_DELAY:
+                    log.info("auto-trusting %s", path)
+                    self.tmux.send(name, "y", "Enter")
+                    self.prompt_seen[name] = now + 2  # don't re-answer before it redraws
             elif "Connected" in screen:
-                del self.trust_pending[name]
+                self.trust_pending.pop(name, None)
+                self.prompt_seen.pop(name, None)
 
     # ---- loop
     def reconcile(self) -> None:
-        want = self.desired()
         have = self.tmux.sessions(self.cfg["session_prefix"])
+        want = self.desired(have)
 
         # sessions that vanished without us stopping them => crashed/exited
         for name, bo in self.backoff.items():
@@ -253,6 +271,9 @@ class Manager:
             if cur is None:
                 self.start(name, path, mode)
             else:
+                if self.cfg["auto_trust"] and name not in self.trust_pending \
+                        and "[y/N]" in self.tmux.capture(name)[-300:]:
+                    self.trust_pending[name] = time.time() + 120
                 bo = self.backoff.get(name)
                 if bo and bo.failures and time.time() - bo.started_at > 120:
                     bo.failures = 0  # stable again
