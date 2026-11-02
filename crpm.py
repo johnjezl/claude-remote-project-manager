@@ -43,7 +43,7 @@ DEFAULTS = {
     "claude_bin": "claude",
     "spawn_mode": "worktree",    # for git repos
     "non_git": "same-dir",       # "same-dir" | "skip" for folders that are not git repos
-    "auto_trust": True,          # answer the first-run "Trust <folder>?" prompt with y
+    "auto_trust": False,         # answer the first-run "Trust <folder>?" prompt with y (trusts everything in projects_dir)
     "permission_mode": "",       # e.g. "acceptEdits"; empty = claude default
     "capacity": 0,               # 0 = claude default (32)
     "create_session_in_dir": True,
@@ -134,6 +134,7 @@ class Manager:
     backoff: dict[str, Backoff] = field(default_factory=dict)
     trust_pending: dict[str, float] = field(default_factory=dict)   # name -> give-up deadline
     prompt_seen: dict[str, float] = field(default_factory=dict)     # name -> when prompt first seen
+    trust_hinted: set[str] = field(default_factory=set)
     stopping: bool = False
 
     def __post_init__(self):
@@ -271,9 +272,13 @@ class Manager:
             if cur is None:
                 self.start(name, path, mode)
             else:
-                if self.cfg["auto_trust"] and name not in self.trust_pending \
-                        and "[y/N]" in self.tmux.capture(name)[-300:]:
-                    self.trust_pending[name] = time.time() + 120
+                if name not in self.trust_pending and "[y/N]" in self.tmux.capture(name)[-300:]:
+                    if self.cfg["auto_trust"]:
+                        self.trust_pending[name] = time.time() + 120
+                    elif name not in self.trust_hinted:
+                        self.trust_hinted.add(name)
+                        log.info("%s is waiting for you to trust it: run `crpm attach %s` and answer y",
+                                 name, path.name)
                 bo = self.backoff.get(name)
                 if bo and bo.failures and time.time() - bo.started_at > 120:
                     bo.failures = 0  # stable again

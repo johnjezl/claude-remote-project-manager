@@ -11,7 +11,8 @@ session_prefix   = "rc-"      # tmux session = rc-<project>
 claude_bin       = "claude"
 spawn_mode       = "worktree" # git repos: each remote session gets its own worktree
 non_git          = "same-dir" # folders without .git: "same-dir" or "skip"
-auto_trust       = true       # answer the first-run "Trust <folder>? [y/N]" prompt with y
+auto_trust       = false      # true = answer the first-run "Trust <folder>? [y/N]" prompt with y,
+                              # i.e. trust EVERY folder in projects_dir (its hooks, MCP servers, settings)
 permission_mode  = ""         # e.g. "acceptEdits" / "plan"; "" = claude default
 capacity         = 0          # max concurrent sessions per project; 0 = claude default (32)
 create_session_in_dir = true  # pre-create one session in the main checkout

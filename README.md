@@ -14,10 +14,12 @@ claude.ai/code or the Claude mobile app.
   its server (Ctrl-C first, then kill after `stop_timeout`).
 * **Self-healing.** A server that exits is restarted with backoff (5s → 15s → 60s → 300s).
 * **Trust prompt.** The first time `remote-control` runs in a folder it asks
-  `Trust <folder>? [y/N]`. With `auto_trust = true` (the default) crpm answers `y`.
-  This means **everything you put in `~/projects` is trusted**: its hooks,
-  MCP servers and settings will run. Set `auto_trust = false` to answer each one
-  yourself with `crpm attach <project>`.
+  `Trust <folder>? [y/N]`. By default you answer it yourself, once per folder:
+  `crpm status` shows `WAITING FOR TRUST PROMPT`, the log says which project,
+  and `crpm attach <project>` lets you answer `y` (then detach with Ctrl-b d).
+  Set `auto_trust = true` to have crpm answer `y` for you. That makes it fully
+  hands-off, but **everything you put in `~/projects` is then trusted**: its
+  hooks, MCP servers and settings will run.
 * **Survives restarts.** Stopping or restarting the service only stops the daemon.
   The tmux server keeps running and the daemon picks the sessions back up when it
   starts. `crpm stop-all` tears them down.
