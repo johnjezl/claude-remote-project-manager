@@ -48,6 +48,7 @@ To have crpm start at boot without logging in, enable linger: `sudo loginctl ena
 crpm status                     # project, state, sessions in use/capacity, spawn mode, path
 crpm attach sd-mux              # watch or answer a project's remote-control TUI (detach: Ctrl-b d)
 crpm restart sd-mux             # bounce one project
+crpm reconnect                  # from a session's worktree: bring that session back in tmux
 crpm stop-all                   # stop every server (the daemon restarts them unless it is stopped too)
 journalctl --user -u crpm -f    # daemon log
 tmux -L crpm ls                 # raw tmux view

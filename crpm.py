@@ -12,12 +12,14 @@ Subcommands:
   status            list managed projects and their state
   attach PROJECT    attach your terminal to a project's tmux session
   restart PROJECT   restart one project's remote-control server
+  reconnect         from a session's worktree, bring that session back in tmux
   stop-all          shut down every managed remote-control server
 """
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import logging
 import os
 import re
@@ -359,6 +361,73 @@ def cmd_restart(cfg: dict, a) -> int:
     return 0
 
 
+# Must not start with session_prefix: the daemon stops any such session that isn't a project.
+RECONNECT_PREFIX = "reconnect-"
+BRIDGE_WORKTREE = re.compile(r"^bridge-cse_([A-Za-z0-9]+)$")
+RECONNECT_SETTLE = 3.0  # seconds a reconnect must survive before we call it started
+
+
+def bridge_worktree(start: Path) -> tuple[Path, str] | None:
+    """The spawned-session worktree containing `start` -> (worktree root, session ID)."""
+    for d in (start, *start.parents):
+        m = BRIDGE_WORKTREE.match(d.name)
+        if m and d.parent.name == "worktrees" and d.parent.parent.name == ".claude":
+            return d, f"session_{m.group(1)}"
+    return None
+
+
+def serving_pid(session_id: str) -> int | None:
+    """PID of a local process already serving this session, if any."""
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            argv = (proc / "cmdline").read_bytes().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if "remote-control" in argv and "--session-id" in argv and session_id in argv:
+            return int(proc.name)
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+    for record in (config_dir / "sessions").glob("*.json"):
+        try:
+            data = json.loads(record.read_text())
+            if data.get("bridgeSessionId") == session_id and Path(f"/proc/{int(data['pid'])}").exists():
+                return int(data["pid"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return None
+
+
+def cmd_reconnect(cfg: dict, _a) -> int:
+    found = bridge_worktree(Path.cwd())
+    if not found:
+        print("crpm reconnect: run this from inside a session worktree (.claude/worktrees/bridge-cse_*)",
+              file=sys.stderr)
+        return 1
+    worktree, session_id = found
+    project = worktree.parents[2].name
+    name = session_name(RECONNECT_PREFIX, f"{project}-{session_id.removeprefix('session_')}")
+    attach = f"tmux -L {cfg['tmux_socket']} attach -t {name}"
+    t = Tmux(cfg["tmux_socket"])
+    if t.has(name):
+        print(f"{session_id} is already running in tmux: {attach}")
+        return 0
+    pid = serving_pid(session_id)
+    if pid:
+        print(f"crpm reconnect: {session_id} is already being served by PID {pid}. "
+              "Stop that process first if it is stuck.", file=sys.stderr)
+        return 1
+    cmd = shlex.join([cfg["claude_bin"], "remote-control", "--session-id", session_id])
+    if not t.new_session(name, str(worktree), cmd, {}):
+        return 1
+    time.sleep(RECONNECT_SETTLE)
+    if not t.has(name):
+        print(f"crpm reconnect: claude exited right away. To see why, run this in {worktree}:\n  {cmd}\n"
+              "Claude Code can only reattach for about 4 hours after the session's server stopped.",
+              file=sys.stderr)
+        return 1
+    print(f"reconnected {session_id}\n  watch: {attach}  (detach: Ctrl-b d)")
+    return 0
+
+
 def cmd_stop_all(cfg: dict, _a) -> int:
     m = Manager(cfg)
     for name in m.tmux.sessions(cfg["session_prefix"]):
@@ -374,6 +443,7 @@ def main(argv=None) -> int:
     sub.add_parser("daemon")
     sub.add_parser("status")
     sub.add_parser("stop-all")
+    sub.add_parser("reconnect")
     for n in ("attach", "restart"):
         sp = sub.add_parser(n)
         sp.add_argument("project")
@@ -386,7 +456,7 @@ def main(argv=None) -> int:
         Manager(cfg).run()
         return 0
     return {"status": cmd_status, "attach": cmd_attach, "restart": cmd_restart,
-            "stop-all": cmd_stop_all}[a.cmd](cfg, a)
+            "reconnect": cmd_reconnect, "stop-all": cmd_stop_all}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":
