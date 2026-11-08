@@ -23,3 +23,5 @@ extra_args       = []         # appended to `claude remote-control`
 
 restart_backoff  = [5, 15, 60, 300]   # seconds, after successive crashes
 stop_timeout     = 10
+log_dir          = "~/.local/state/crpm"  # <session>.exit.log: why a server exited
+exit_log_lines   = 80

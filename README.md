@@ -66,4 +66,6 @@ rm ~/.config/systemd/user/crpm.service ~/.local/bin/crpm
 * New folders are registered after `settle_seconds` (15s) so a `git clone` has time to finish.
 * Folder names starting with `.` or `_` are ignored by default (`exclude`).
 * Worktrees are created by Claude Code inside each repo. crpm doesn't manage or clean them up.
+* If a server exits, the daemon logs its exit status and last screen to
+  `~/.local/state/crpm/<session>.exit.log` (and a one-line summary to the journal), then restarts it.
 * Requires Python ≥ 3.11 (stdlib only), tmux, and a logged-in `claude`.

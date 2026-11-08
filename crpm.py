@@ -59,6 +59,8 @@ DEFAULTS = {
     "exclude": [".*", "_*"],     # glob patterns of folder names to ignore
     "restart_backoff": [5, 15, 60, 300],
     "stop_timeout": 10,
+    "log_dir": "~/.local/state/crpm",  # <session>.exit.log: exit status + last screen of servers that exited
+    "exit_log_lines": 80,
 }
 
 
@@ -81,21 +83,30 @@ class Tmux:
         return subprocess.run(["tmux", "-L", self.socket, *args],
                               capture_output=True, text=True, check=check)
 
+    FIELDS = ("path", "mode", "cmd", "dead", "status", "signal", "retained")
+
     def sessions(self, prefix: str) -> dict[str, dict]:
-        """Managed sessions -> {name: {path, mode, cmd}}."""
-        fmt = "#{session_name}\t#{@crpm_path}\t#{@crpm_mode}\t#{@crpm_cmd}"
+        """Managed sessions -> {name: {path, mode, cmd, dead, status, signal, retained}}."""
+        fmt = "\t".join(["#{session_name}", "#{@crpm_path}", "#{@crpm_mode}", "#{@crpm_cmd}",
+                         "#{pane_dead}", "#{pane_dead_status}", "#{pane_dead_signal}",
+                         "#{remain-on-exit}"])
         r = self.run("list-sessions", "-F", fmt)
         out = {}
         if r.returncode != 0:  # no server running
             return out
         for line in r.stdout.splitlines():
-            name, path, mode, cmd = (line.split("\t") + ["", "", ""])[:4]
+            name, *vals = line.split("\t")
             if name.startswith(prefix):
-                out[name] = {"path": path, "mode": mode, "cmd": cmd}
+                info = dict(zip(self.FIELDS, vals + [""] * len(self.FIELDS)))
+                info["dead"] = info["dead"] == "1"
+                info["retained"] = info["retained"] == "on"
+                out[name] = info
         return out
 
     def new_session(self, name: str, cwd: str, command: str, opts: dict[str, str]) -> bool:
-        r = self.run("new-session", "-d", "-s", name, "-c", cwd, "-x", "200", "-y", "50", command)
+        # remain-on-exit is set in the same tmux call, so even an instant exit keeps its pane
+        r = self.run("new-session", "-d", "-s", name, "-c", cwd, "-x", "200", "-y", "50", command,
+                     ";", "set-option", "-w", "remain-on-exit", "on")
         if r.returncode != 0:
             log.error("tmux new-session %s failed: %s", name, r.stderr.strip())
             return False
@@ -103,8 +114,17 @@ class Tmux:
             self.run("set-option", "-t", name, k, v)
         return True
 
-    def capture(self, name: str) -> str:
-        return self.run("capture-pane", "-p", "-J", "-t", name).stdout
+    def capture(self, name: str, history: int = 0) -> str:
+        extra = ["-S", str(-history)] if history else []
+        return self.run("capture-pane", "-p", "-J", *extra, "-t", name).stdout
+
+    def retain(self, name: str) -> None:
+        """Keep the pane (and its exit status) after the command exits."""
+        self.run("set-option", "-w", "-t", name, "remain-on-exit", "on")
+
+    def is_dead(self, name: str) -> bool:
+        r = self.run("display-message", "-p", "-t", name, "#{pane_dead}")
+        return r.returncode == 0 and r.stdout.strip() == "1"
 
     def send(self, name: str, *keys: str) -> None:
         self.run("send-keys", "-t", name, *keys)
@@ -242,15 +262,41 @@ class Manager:
     def stop(self, name: str) -> None:
         log.info("de-register %s", name)
         if self.tmux.has(name):
-            self.tmux.send(name, "C-c")
-            deadline = time.time() + self.cfg["stop_timeout"]
-            while time.time() < deadline and self.tmux.has(name):
-                time.sleep(0.5)
+            if not self.tmux.is_dead(name):
+                self.tmux.send(name, "C-c")
+                deadline = time.time() + self.cfg["stop_timeout"]
+                while time.time() < deadline and self.tmux.has(name) and not self.tmux.is_dead(name):
+                    time.sleep(0.5)
             if self.tmux.has(name):
                 self.tmux.kill(name)
         self.backoff.pop(name, None)
         self.trust_pending.pop(name, None)
         self.prompt_seen.pop(name, None)
+
+    def record_exit(self, name: str, info: dict) -> None:
+        """Log why a server exited (exit status + last screen), then clear its dead pane."""
+        how = f"signal {info['signal']}" if info["signal"] else f"status {info['status'] or '?'}"
+        screen = self.tmux.capture(name, history=self.cfg["exit_log_lines"])
+        lines: list[str] = []
+        for l in screen.splitlines():  # drop the pane's padding: no runs of blank lines
+            l = l.rstrip()
+            if l or (lines and lines[-1]):
+                lines.append(l)
+        while lines and not lines[-1]:
+            lines.pop()
+        tail = lines[-self.cfg["exit_log_lines"]:]
+        last = next((l for l in reversed(tail) if l.strip() and not l.startswith("Pane is dead")), "")
+        path = Path(self.cfg["log_dir"]).expanduser() / f"{name}.exit.log"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as f:
+                f.write(f"===== {time.strftime('%Y-%m-%d %H:%M:%S %z')} {name} exited ({how})\n"
+                        f"cmd: {info['cmd']}\n" + "\n".join(tail) + "\n\n")
+            where = f"; screen saved to {path}"
+        except OSError as e:
+            where = f"; could not write {path}: {e}"
+        log.warning("%s exited (%s); last line: %s%s", name, how, last.strip() or "(blank)", where)
+        self.tmux.kill(name)
 
     def handle_trust_prompts(self, running: dict[str, dict]) -> None:
         """Answer `Trust <path>? [y/N]` with y. Claude rejects answers that arrive
@@ -279,6 +325,13 @@ class Manager:
     # ---- loop
     def reconcile(self) -> None:
         have = self.tmux.sessions(self.cfg["session_prefix"])
+        for name, info in list(have.items()):
+            if info["dead"]:
+                self.record_exit(name, info)
+                del have[name]
+                self.note_failure(name)
+            elif not info["retained"]:  # adopted from before exit logging existed
+                self.tmux.retain(name)
         want = self.desired(have)
 
         # sessions that vanished without us stopping them => crashed/exited
@@ -344,7 +397,10 @@ def cmd_status(cfg: dict, _a) -> int:
         return 0
     for name, info in sorted(have.items()):
         screen = t.capture(name)
-        state = screen_state(screen)
+        if info["dead"]:
+            state = f"exited ({'signal ' + info['signal'] if info['signal'] else 'status ' + info['status']})"
+        else:
+            state = screen_state(screen)
         cap = re.search(r"Capacity: (\d+/\d+)", screen)
         print(f"{name:40} {state:26} {cap.group(1) if cap else '':8} {info['mode']:9} {info['path']}")
     return 0
