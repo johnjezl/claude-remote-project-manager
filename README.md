@@ -49,6 +49,8 @@ crpm status                     # project, state, sessions in use/capacity, spaw
 crpm attach sd-mux              # watch or answer a project's remote-control TUI (detach: Ctrl-b d)
 crpm restart sd-mux             # bounce one project
 crpm reconnect                  # from a session's worktree: bring that session back in tmux
+crpm restart-session [ID...]    # restart idle sessions to load new settings/MCP servers/etc.
+                                #   (--project NAME for all of a project's sessions, --dry-run to preview)
 crpm stop-all                   # stop every server (the daemon restarts them unless it is stopped too)
 journalctl --user -u crpm -f    # daemon log
 tmux -L crpm ls                 # raw tmux view
