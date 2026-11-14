@@ -14,6 +14,7 @@ Subcommands:
   restart PROJECT   restart one project's remote-control server
   reconnect         from a session's worktree, bring that session back in tmux
   restart-session   restart idle sessions so they load new settings, MCP servers, etc.
+  new-session       start a new Remote Control session in a project (in its own worktree)
   stop-all          shut down every managed remote-control server
 """
 from __future__ import annotations
@@ -744,6 +745,93 @@ def cmd_restart_session(cfg: dict, a) -> int:
     return rc
 
 
+# --------------------------------------------------------------------------- new-session
+
+NEW_SESSION_PREFIX = "sess-"   # must not start with session_prefix (the daemon would stop it)
+REGISTER_TIMEOUT = 45.0        # seconds to wait for the new session to connect to claude.ai
+
+
+def project_from_cwd(cfg: dict) -> Path | None:
+    here, root = Path.cwd(), cfg["projects_dir"]
+    if here == root or root not in here.parents:
+        return None
+    return root / here.relative_to(root).parts[0]
+
+
+def git_has_commit(path: Path) -> bool:
+    return subprocess.run(["git", "-C", str(path), "rev-parse", "--verify", "-q", "HEAD"],
+                          capture_output=True).returncode == 0
+
+
+def wait_for_session(pane_pid: int, timeout: float) -> LiveSession | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for s in live_sessions():
+            if pane_pid in (s.pid, s.parent_pid):
+                return s
+        if proc_start(pane_pid) is None:
+            return None
+        time.sleep(1)
+    return None
+
+
+def cmd_new_session(cfg: dict, a) -> int:
+    if a.project and not a.prompt and "/" not in a.project and project_from_cwd(cfg) \
+            and not (cfg["projects_dir"] / a.project).is_dir():
+        a.project, a.prompt = None, a.project  # `crpm new-session "message"` from inside a project
+    if a.project:
+        project = Path(a.project).expanduser() if "/" in a.project else cfg["projects_dir"] / a.project
+    else:
+        project = project_from_cwd(cfg)
+        if project is None:
+            print("crpm new-session: name a project, or run this from inside one", file=sys.stderr)
+            return 1
+    project = project.resolve()
+    if not project.is_dir():
+        print(f"crpm new-session: no project folder {project}", file=sys.stderr)
+        return 1
+    stamp = time.strftime("%m%d-%H%M%S")
+    name = a.name or f"{project.name}-{stamp}"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or stamp
+
+    argv = [cfg["claude_bin"]]
+    use_worktree = (project / ".git").exists() and not a.here
+    if use_worktree:
+        if not git_has_commit(project):
+            print(f"crpm new-session: {project.name} has no commits yet, and a worktree is made from one. "
+                  "Commit first, or pass --here to work in the project folder.", file=sys.stderr)
+            return 1
+        if (project / ".claude" / "worktrees" / slug).exists():
+            print(f"crpm new-session: worktree {slug} already exists; pick another --name", file=sys.stderr)
+            return 1
+        argv.append(f"--worktree={slug}")
+    if cfg["permission_mode"]:
+        argv += ["--permission-mode", cfg["permission_mode"]]
+    argv.append(f"--remote-control={name}")
+    if a.prompt:
+        argv += ["--", a.prompt]
+    cmd = shlex.join(argv)
+
+    tname = session_name(NEW_SESSION_PREFIX, f"{project.name}-{slug}")
+    t = Tmux(cfg["tmux_socket"])
+    if t.has(tname):
+        print(f"crpm new-session: tmux session {tname} already exists; pick another --name", file=sys.stderr)
+        return 1
+    if launch_detached(cfg, tname, project, cmd, f"{name} ({'worktree ' + slug if use_worktree else 'in ' + str(project)})"):
+        return 1
+    pane_pid = int(t.run("display-message", "-p", "-t", tname, "#{pane_pid}").stdout.strip() or 0)
+    s = wait_for_session(pane_pid, REGISTER_TIMEOUT)
+    if s:
+        print(f"  connected: https://claude.ai/code/{s.session_id}\n  folder: {s.cwd}")
+        return 0
+    if t.has(tname) and not t.is_dead(tname):
+        print(f"  not connected to claude.ai after {REGISTER_TIMEOUT:.0f}s; it may be waiting on a prompt. "
+              f"Attach to check: tmux -L {cfg['tmux_socket']} attach -t {tname}", file=sys.stderr)
+    else:
+        print(f"  claude exited. To see why, run in {project}:\n  {cmd}", file=sys.stderr)
+    return 1
+
+
 def cmd_stop_all(cfg: dict, _a) -> int:
     m = Manager(cfg)
     for name in m.tmux.sessions(cfg["session_prefix"]):
@@ -768,6 +856,12 @@ def main(argv=None) -> int:
     rs.add_argument("--force", action="store_true", help="also restart sessions that are not idle")
     rs.add_argument("--dry-run", action="store_true", help="only show what would be restarted")
     rs.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
+    ns = sub.add_parser("new-session", help="start a new Remote Control session in a project")
+    ns.add_argument("project", nargs="?", help="project folder name or path (default: the project you're in)")
+    ns.add_argument("prompt", nargs="?", help="first message for the session")
+    ns.add_argument("-n", "--name", help="session name in the app, also used for the worktree "
+                                         "(default: <project>-<date>-<time>)")
+    ns.add_argument("--here", action="store_true", help="work in the project folder, not a new worktree")
     for n in ("attach", "restart"):
         sp = sub.add_parser(n)
         sp.add_argument("project")
@@ -781,6 +875,7 @@ def main(argv=None) -> int:
         return 0
     return {"status": cmd_status, "attach": cmd_attach, "restart": cmd_restart,
             "reconnect": cmd_reconnect, "restart-session": cmd_restart_session,
+            "new-session": cmd_new_session,
             "stop-all": cmd_stop_all}[a.cmd](cfg, a)
 
 
