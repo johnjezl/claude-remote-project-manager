@@ -84,13 +84,13 @@ class Tmux:
         return subprocess.run(["tmux", "-L", self.socket, *args],
                               capture_output=True, text=True, check=check)
 
-    FIELDS = ("path", "mode", "cmd", "dead", "status", "signal", "retained")
+    FIELDS = ("path", "mode", "cmd", "dead", "status", "signal", "retained", "pid")
 
     def sessions(self, prefix: str) -> dict[str, dict]:
-        """Managed sessions -> {name: {path, mode, cmd, dead, status, signal, retained}}."""
+        """Managed sessions -> {name: {path, mode, cmd, dead, status, signal, retained, pid}}."""
         fmt = "\t".join(["#{session_name}", "#{@crpm_path}", "#{@crpm_mode}", "#{@crpm_cmd}",
                          "#{pane_dead}", "#{pane_dead_status}", "#{pane_dead_signal}",
-                         "#{remain-on-exit}"])
+                         "#{remain-on-exit}", "#{pane_pid}"])
         r = self.run("list-sessions", "-F", fmt)
         out = {}
         if r.returncode != 0:  # no server running
@@ -184,6 +184,8 @@ class Manager:
     trust_pending: dict[str, float] = field(default_factory=dict)   # name -> give-up deadline
     prompt_seen: dict[str, float] = field(default_factory=dict)     # name -> when prompt first seen
     trust_hinted: set[str] = field(default_factory=set)
+    committed: set[Path] = field(default_factory=set)     # git repos known to have a commit
+    deferred: dict[str, str] = field(default_factory=dict)  # name -> command it will restart with
     stopping: bool = False
 
     def __post_init__(self):
@@ -214,7 +216,7 @@ class Manager:
             self.first_seen.setdefault(p.name, now)
             if sname not in have and now - self.first_seen[p.name] < self.cfg["settle_seconds"]:
                 continue
-            if (p / ".git").exists():
+            if (p / ".git").exists() and self.has_commit(p):
                 mode = self.cfg["spawn_mode"]
             elif self.cfg["non_git"] == "skip":
                 continue
@@ -224,6 +226,21 @@ class Manager:
         for gone in set(self.first_seen) - seen:
             del self.first_seen[gone]
         return want
+
+    def has_commit(self, path: Path) -> bool:
+        """Worktrees are made from a commit, so a repo without one still counts as non-git."""
+        if path not in self.committed:
+            r = subprocess.run(["git", "-C", str(path), "rev-parse", "--verify", "-q", "HEAD"],
+                               capture_output=True)
+            if r.returncode != 0:
+                return False
+            self.committed.add(path)
+        return True
+
+    @staticmethod
+    def sessions_in_use(server_pid: str) -> int:
+        """Sessions a project's remote-control server is serving right now."""
+        return sum(1 for s in live_sessions() if str(s.parent_pid) == server_pid)
 
     def command_for(self, path: Path, mode: str) -> str:
         c = self.cfg
@@ -275,6 +292,7 @@ class Manager:
         self.backoff.pop(name, None)
         self.trust_pending.pop(name, None)
         self.prompt_seen.pop(name, None)
+        self.deferred.pop(name, None)
 
     def record_exit(self, name: str, info: dict) -> None:
         """Log why a server exited (exit status + last screen), then clear its dead pane."""
@@ -347,9 +365,19 @@ class Manager:
 
         for name, (path, mode) in sorted(want.items()):
             cur = have.get(name)
-            if cur and (cur["path"] != str(path) or cur["cmd"] != self.command_for(path, mode)):
-                # folder became a git repo, or the config changed
-                log.info("%s settings changed; restarting with: %s", name, self.command_for(path, mode))
+            new_cmd = self.command_for(path, mode)
+            if cur and (cur["path"] != str(path) or cur["cmd"] != new_cmd):
+                # folder became a git repo, or the config changed. Stopping the server ends (and
+                # archives) every session it serves, so wait until it isn't serving any.
+                in_use = self.sessions_in_use(cur["pid"])
+                if in_use:
+                    if self.deferred.get(name) != new_cmd:
+                        self.deferred[name] = new_cmd
+                        log.info("%s settings changed; will restart once its %d open session(s) end "
+                                 "(or now: crpm restart %s): %s", name, in_use, path.name, new_cmd)
+                    continue
+                self.deferred.pop(name, None)
+                log.info("%s settings changed; restarting with: %s", name, new_cmd)
                 self.stop(name)
                 cur = None
             if cur is None:

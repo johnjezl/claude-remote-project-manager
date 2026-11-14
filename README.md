@@ -65,6 +65,9 @@ rm ~/.config/systemd/user/crpm.service ~/.local/bin/crpm
 
 ## Notes
 
+* A project's server is only restarted for a settings change (config edit, or the folder becoming a
+  git repo) once it has no open sessions, since stopping it ends them. `crpm restart` forces it.
+  A new repo stays in same-dir mode until its first commit, because worktrees are made from a commit.
 * New folders are registered after `settle_seconds` (15s) so a `git clone` has time to finish.
 * Folder names starting with `.` or `_` are ignored by default (`exclude`).
 * Worktrees are created by Claude Code inside each repo. crpm doesn't manage or clean them up.
