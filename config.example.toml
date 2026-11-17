@@ -25,3 +25,6 @@ restart_backoff  = [5, 15, 60, 300]   # seconds, after successive crashes
 stop_timeout     = 10
 log_dir          = "~/.local/state/crpm"  # <session>.exit.log: why a server exited
 exit_log_lines   = 80
+
+web_listen       = "127.0.0.1:8765"   # crpm web dashboard. Keep it on loopback and reach it from other
+                                      # devices with `tailscale serve` or an SSH tunnel (see README)

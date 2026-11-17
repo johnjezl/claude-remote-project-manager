@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>crpm</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23c96442'/%3E%3Cpath d='M9 11l6 5-6 5M17 22h7' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f6f5f1; --panel: #ffffff; --panel-2: #f0eee8; --text: #1d1c1a; --muted: #6b6860;
+  --border: #e2dfd6; --accent: #c96442; --accent-text: #ffffff; --accent-soft: #f6e4dc;
+  --ok: #2f7d4f; --ok-soft: #dcefe3; --warn: #a15c00; --warn-soft: #fbecd2;
+  --bad: #b3261e; --bad-soft: #f9dedc; --busy: #2b6cb0; --busy-soft: #dde9f7;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --radius: 10px; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 2px 8px rgba(0,0,0,.04);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1a1918; --panel: #242321; --panel-2: #2c2b28; --text: #ecebe6; --muted: #a09d94;
+    --border: #3a3834; --accent: #d97757; --accent-text: #1a1918; --accent-soft: #3d2a22;
+    --ok: #6cc28c; --ok-soft: #1f3327; --warn: #e7a84a; --warn-soft: #3a2d17;
+    --bad: #f08a80; --bad-soft: #3d2120; --busy: #79aef0; --busy-soft: #1f2b3b;
+    --shadow: none; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #1a1918; --panel: #242321; --panel-2: #2c2b28; --text: #ecebe6; --muted: #a09d94;
+  --border: #3a3834; --accent: #d97757; --accent-text: #1a1918; --accent-soft: #3d2a22;
+  --ok: #6cc28c; --ok-soft: #1f3327; --warn: #e7a84a; --warn-soft: #3a2d17;
+  --bad: #f08a80; --bad-soft: #3d2120; --busy: #79aef0; --busy-soft: #1f2b3b;
+  --shadow: none; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+.wrap { max-width: 880px; margin: 0 auto; padding: 0 16px calc(32px + env(safe-area-inset-bottom)); }
+header {
+  position: sticky; top: 0; z-index: 5; background: var(--bg);
+  padding: calc(12px + env(safe-area-inset-top)) 0 10px; border-bottom: 1px solid var(--border);
+}
+.bar { display: flex; align-items: center; gap: 10px; }
+.brand { font-weight: 700; font-size: 18px; letter-spacing: -.01em; }
+.host { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spacer { flex: 1; }
+.live { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.live i { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); display: inline-block; }
+.live.stale i { background: var(--bad); }
+.tools { display: flex; gap: 8px; margin-top: 10px; }
+input, textarea, select {
+  font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 9px 11px; width: 100%; min-width: 0;
+}
+textarea { resize: vertical; min-height: 96px; }
+input:focus, textarea:focus, select:focus, button:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+button, .btn {
+  font: inherit; font-size: 14px; font-weight: 550; cursor: pointer; text-decoration: none;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border-radius: 8px; padding: 8px 12px; border: 1px solid var(--border);
+  background: var(--panel); color: var(--text); white-space: nowrap; min-height: 36px;
+}
+button:hover, .btn:hover { background: var(--panel-2); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+button.primary:hover { filter: brightness(1.06); background: var(--accent); }
+button.danger { color: var(--bad); }
+button.attn { background: var(--warn); border-color: var(--warn); color: var(--panel); }
+button:disabled { opacity: .55; cursor: default; }
+button.small, .btn.small { font-size: 13px; padding: 5px 10px; min-height: 30px; }
+.spin {
+  width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent;
+  border-radius: 50%; animation: spin .8s linear infinite; display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.banner { margin: 14px 0 0; padding: 10px 12px; border-radius: var(--radius); background: var(--bad-soft); color: var(--bad); }
+.list { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.section-title { margin: 22px 0 4px; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+details.proj { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+details.proj[open] { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+details.proj > summary { list-style: none; cursor: pointer; padding: 12px 14px; display: flex; align-items: center; gap: 10px; }
+details.proj > summary::-webkit-details-marker { display: none; }
+.chev { color: var(--muted); transition: transform .15s; flex: none; }
+details[open] > summary .chev { transform: rotate(90deg); }
+.pname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.badges { display: flex; gap: 6px; align-items: center; flex: none; margin-left: auto; }
+.badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+.badge.ok { background: var(--ok-soft); color: var(--ok); }
+.badge.warn { background: var(--warn-soft); color: var(--warn); }
+.badge.bad { background: var(--bad-soft); color: var(--bad); }
+.badge.busy { background: var(--busy-soft); color: var(--busy); }
+.body { padding: 0 14px 14px; border-top: 1px solid var(--border); }
+.meta { color: var(--muted); font-size: 13px; margin: 10px 0; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.meta code, .mono { font-family: var(--mono); font-size: 12.5px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px; }
+.sess { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; border-top: 1px dashed var(--border); }
+.sess:first-child { border-top: 0; }
+.dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 6px; flex: none; background: var(--muted); }
+.dot.idle { background: var(--ok); }
+.dot.busy { background: var(--busy); box-shadow: 0 0 0 3px var(--busy-soft); }
+.dot.local { background: transparent; border: 2px solid var(--muted); }
+.sinfo { flex: 1; min-width: 0; }
+.sname { font-weight: 550; overflow-wrap: anywhere; }
+.ssub { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.sact { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.subhead { font-size: 12px; color: var(--muted); font-weight: 600; margin: 14px 0 0; text-transform: uppercase; letter-spacing: .04em; }
+.empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+details.recover > summary { cursor: pointer; font-size: 13px; color: var(--muted); margin-top: 12px; }
+dialog {
+  border: 1px solid var(--border); border-radius: 14px; padding: 0; background: var(--panel); color: var(--text);
+  width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); box-shadow: 0 10px 40px rgba(0,0,0,.25);
+}
+dialog.wide { width: min(980px, calc(100vw - 32px)); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+.dlg { padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+.dlg h2 { margin: 0; font-size: 17px; }
+.dlg label { font-size: 13px; font-weight: 600; display: flex; flex-direction: column; gap: 5px; }
+.dlg label.check { flex-direction: row; align-items: center; gap: 8px; font-weight: 500; }
+.dlg label.check input { width: auto; }
+.hint { font-size: 12.5px; color: var(--muted); font-weight: 400; }
+.dlg .row { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+pre.screen {
+  margin: 0; padding: 12px; background: #141413; color: #e8e6df; border-radius: 8px;
+  font: 12px/1.35 var(--mono); overflow: auto; max-height: 55dvh; white-space: pre;
+}
+.result { padding: 12px; border-radius: 8px; background: var(--ok-soft); color: var(--ok); overflow-wrap: anywhere; }
+.result.err { background: var(--bad-soft); color: var(--bad); white-space: pre-wrap; font-size: 13px; }
+.result a { color: inherit; font-weight: 600; }
+#toasts { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 20;
+  display: flex; flex-direction: column; gap: 8px; width: min(560px, calc(100vw - 32px)); }
+.toast { padding: 10px 14px; border-radius: 10px; background: var(--text); color: var(--bg); font-size: 14px;
+  white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 6px 20px rgba(0,0,0,.2); cursor: pointer; }
+.toast.err { background: var(--bad); color: #fff; }
+.login { max-width: 420px; margin: 12vh auto 0; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; }
+@media (max-width: 560px) {
+  .hide-sm { display: none; }
+  .sess { flex-wrap: wrap; }
+  .sact { width: 100%; justify-content: flex-start; padding-left: 19px; }
+}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts" aria-live="polite"></div>
+
+<dialog id="newDlg">
+  <form class="dlg" id="newForm">
+    <h2>New session</h2>
+    <label>Project<select id="nsProject" required></select></label>
+    <label>First message <span class="hint">optional; the session starts on it right away</span>
+      <textarea id="nsPrompt" placeholder="What should Claude work on?"></textarea></label>
+    <label>Name <span class="hint">optional; shown in the app and used for the worktree</span>
+      <input id="nsName" autocomplete="off" placeholder="project-date-time"></label>
+    <label class="check"><input type="checkbox" id="nsHere"> Work in the project folder (no new worktree)</label>
+    <div class="hint" id="nsHereHint"></div>
+    <div id="nsResult"></div>
+    <div class="row">
+      <button type="button" id="nsCancel">Close</button>
+      <button type="submit" class="primary" id="nsGo">Start session</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="screenDlg" class="wide">
+  <div class="dlg">
+    <h2 id="scTitle">Screen</h2>
+    <pre class="screen" id="scScreen"></pre>
+    <div id="scExitWrap" hidden>
+      <div class="subhead" style="margin:0 0 6px">Last exit log</div>
+      <pre class="screen" id="scExit"></pre>
+    </div>
+    <div class="row">
+      <button type="button" id="scRefresh">Refresh</button>
+      <button type="button" class="primary" id="scClose">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="confirmDlg">
+  <form class="dlg" method="dialog">
+    <h2 id="cfTitle"></h2>
+    <div id="cfBody"></div>
+    <div class="row">
+      <button value="no">Cancel</button>
+      <button value="yes" class="primary" id="cfYes">Confirm</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+const POLL_MS = 5000;
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
+
+// ---- auth: a login link carries the token in the URL fragment (never sent to the server)
+let token = store.get("crpm-token", "");
+{
+  const m = location.hash.match(/token=([^&]+)/);
+  if (m) { token = decodeURIComponent(m[1]); store.set("crpm-token", token); history.replaceState(null, "", location.pathname); }
+}
+
+// ---- tiny DOM helper: every string goes in as text, never as HTML
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === false || v == null) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "text") el.textContent = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid instanceof Node ? kid : String(kid));
+  return el;
+}
+const chev = () => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  s.setAttribute("viewBox", "0 0 16 16"); s.setAttribute("width", "14"); s.setAttribute("height", "14"); s.classList.add("chev");
+  const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  p.setAttribute("d", "M6 3l5 5-5 5"); p.setAttribute("fill", "none"); p.setAttribute("stroke", "currentColor"); p.setAttribute("stroke-width", "2");
+  s.append(p); return s; };
+
+function toast(msg, err) {
+  const t = h("div", { class: "toast" + (err ? " err" : ""), text: msg, onclick: () => t.remove() });
+  $("toasts").append(t);
+  setTimeout(() => t.remove(), err ? 12000 : 6000);
+}
+
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method, headers: { "Authorization": "Bearer " + token, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined, cache: "no-store",
+  });
+  let data = {};
+  try { data = await r.json(); } catch {}
+  if (r.status === 401) { token = ""; store.del("crpm-token"); renderLogin(data.error); throw new Error("not logged in"); }
+  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  return data;
+}
+
+// ---- state
+let state = null, lastOk = 0, loadError = "", filter = "";
+const open = new Set(store.get("crpm-open", []));
+const pending = new Map();      // action key -> label, so buttons keep their spinner across re-renders
+let pollTimer = null;
+
+async function refresh() {
+  clearTimeout(pollTimer);
+  try {
+    state = await api("GET", "/api/status");
+    lastOk = Date.now(); loadError = "";
+  } catch (e) {
+    if (!token) return;
+    loadError = e.message;
+  }
+  render();
+  pollTimer = setTimeout(refresh, document.hidden ? POLL_MS * 6 : POLL_MS);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden && token) refresh(); });
+
+async function act(key, label, fn, okMsg) {
+  if (pending.has(key)) return;
+  pending.set(key, label); render();
+  try {
+    const r = await fn();
+    toast(okMsg || r.message || "done");
+  } catch (e) {
+    if (token) toast(e.message, true);
+  } finally {
+    pending.delete(key); refresh();
+  }
+}
+
+function confirmBox(title, body, yes = "Confirm") {
+  $("cfTitle").textContent = title;
+  $("cfBody").replaceChildren(...[].concat(body).map((b) => typeof b === "string" ? h("p", { style: "margin:0", text: b }) : b));
+  $("cfYes").textContent = yes;
+  const d = $("confirmDlg");
+  d.returnValue = "";
+  d.showModal();
+  return new Promise((res) => d.addEventListener("close", () => res(d.returnValue === "yes"), { once: true }));
+}
+
+// ---- view helpers
+function serverBadge(p) {
+  const s = p.server;
+  if (!s) return h("span", { class: "badge", text: p.git ? "not registered" : "not registered (no git)" });
+  if (s.dead) return h("span", { class: "badge bad", text: s.state });
+  if (s.state === "WAITING FOR TRUST PROMPT") return h("span", { class: "badge warn", text: "needs trust" });
+  if (["ready", "connected", "attached"].includes(s.state)) return h("span", { class: "badge ok", text: s.state });
+  if (s.state === "reconnecting") return h("span", { class: "badge warn", text: s.state });
+  return h("span", { class: "badge", text: s.state });
+}
+const needsTrust = (p) => p.server && p.server.state === "WAITING FOR TRUST PROMPT";
+const attention = (p) => needsTrust(p) || (p.server && p.server.dead);
+function ago(ts) {
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 90) return "just now";
+  if (s < 5400) return Math.round(s / 60) + " min ago";
+  if (s < 129600) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " days ago";
+}
+function btn(key, label, onclick, cls = "") {
+  const busy = pending.has(key);
+  return h("button", { class: cls, disabled: busy, onclick: (e) => { e.preventDefault(); e.stopPropagation(); onclick(); } },
+    busy ? h("span", { class: "spin" }) : null, busy ? pending.get(key) : label);
+}
+
+function sessionRow(s, project) {
+  const kindText = { spawned: "from app", reattached: "reconnected", terminal: "terminal" }[s.kind] || s.kind;
+  const where = s.worktree ? "worktree " + s.worktree : (s.folder && s.folder !== "." ? s.folder : "project folder");
+  const sub = [s.remote ? s.status : "not on Remote Control", kindText, where].join(" · ");
+  const label = s.name || s.key;
+  const restart = async () => {
+    const force = s.status !== "idle";
+    const body = s.remote ? [
+      `Restart “${label}” so it loads new settings, MCP servers and so on.`,
+      s.kind === "spawned" ? "It stops now; send it a message from the app and its server starts it again." :
+        "The same conversation is resumed with Remote Control on.",
+      ...(force ? [h("p", { style: "margin:0;color:var(--warn)", text: `It is ${s.status} right now; restarting interrupts it.` })] : []),
+    ] : [`“${label}” is running locally but isn't on Remote Control. Restart it with Remote Control on? The same conversation is resumed.`];
+    if (!await confirmBox(s.remote ? "Restart session?" : "Connect to Remote Control?", body,
+      force ? "Restart anyway" : (s.remote ? "Restart" : "Connect"))) return;
+    act("s:" + s.key, s.remote ? "Restarting…" : "Connecting…",
+      () => api("POST", `/api/sessions/${encodeURIComponent(s.key)}/restart`, { force }));
+  };
+  return h("div", { class: "sess" },
+    h("span", { class: "dot " + (s.remote ? s.status : "local"), title: s.remote ? s.status : "local only" }),
+    h("div", { class: "sinfo" },
+      h("div", { class: "sname", text: label }),
+      h("div", { class: "ssub", text: sub })),
+    h("div", { class: "sact" },
+      s.url ? h("a", { class: "btn small", href: s.url, target: "_blank", rel: "noopener noreferrer", text: "Open" }) : null,
+      btn("s:" + s.key, s.remote ? "Restart" : "Connect", restart, "small")));
+}
+
+function projectCard(p) {
+  const s = p.server;
+  const live = p.sessions.filter((x) => x.remote);
+  const busy = live.filter((x) => x.status === "busy").length;
+  const det = h("details", { class: "proj", open: open.has(p.name) });
+  det.addEventListener("toggle", () => {
+    det.open ? open.add(p.name) : open.delete(p.name);
+    store.set("crpm-open", [...open]);
+  });
+  const summary = h("summary", {},
+    chev(),
+    h("span", { class: "pname", text: p.name }),
+    h("span", { class: "badges" },
+      needsTrust(p) ? btn("t:" + p.name, "Trust", () => trust(p), "small attn") : null,
+      p.sessions.length ? h("span", { class: "badge " + (busy ? "busy" : ""),
+        text: busy ? `${busy} busy / ${p.sessions.length}` : `${p.sessions.length} session${p.sessions.length > 1 ? "s" : ""}` }) : null,
+      serverBadge(p)));
+  det.append(summary);
+
+  const body = h("div", { class: "body" });
+  body.append(h("div", { class: "meta" },
+    h("span", {}, h("code", { text: p.path })),
+    s ? h("span", { text: `spawn: ${s.mode}` }) : null,
+    s && s.capacity ? h("span", { text: `capacity ${s.capacity}` }) : null,
+    s && s.created ? h("span", { class: "hide-sm", text: `server up since ${new Date(s.created * 1000).toLocaleString()}` }) : null));
+  if (needsTrust(p)) body.append(h("div", { class: "result err", style: "margin:4px 0 8px",
+    text: "This server is asking whether to trust the folder. Trusting it lets its hooks, MCP servers and settings run." }));
+  body.append(h("div", { class: "actions" },
+    btn("n:" + p.name, "New session", () => openNew(p.name), "primary small"),
+    s ? btn("v:" + p.name, "Screen", () => showScreen(p.name), "small") : null,
+    s ? btn("r:" + p.name, "Restart server", () => restartServer(p), "small danger") : null));
+
+  body.append(h("div", { class: "subhead", text: "Sessions" }));
+  if (p.sessions.length) body.append(h("div", {}, p.sessions.map((x) => sessionRow(x, p))));
+  else body.append(h("div", { class: "empty", text: "No sessions running." }));
+
+  if (p.reconnectable.length) {
+    const rec = h("details", { class: "recover", open: open.has("recover:" + p.name) },
+      h("summary", { text: `Recover sessions whose server stopped (${p.reconnectable.length})` }),
+      h("div", { class: "hint", style: "margin:6px 0", text: "Claude Code can reattach a session for about 4 hours after its server stopped." }),
+      p.reconnectable.map((r) => h("div", { class: "sess" },
+        h("span", { class: "dot local" }),
+        h("div", { class: "sinfo" },
+          h("div", { class: "sname mono", text: r.session_id }),
+          h("div", { class: "ssub", text: "last active " + ago(r.last_active) })),
+        h("div", { class: "sact" },
+          btn("c:" + r.session_id, "Reconnect", () => act("c:" + r.session_id, "Reconnecting…",
+            () => api("POST", `/api/sessions/${encodeURIComponent(r.session_id)}/reconnect`)), "small")))));
+    rec.addEventListener("toggle", () => { rec.open ? open.add("recover:" + p.name) : open.delete("recover:" + p.name); });
+    body.append(rec);
+  }
+  det.append(body);
+  return det;
+}
+
+// ---- actions
+function trust(p) {
+  confirmBox(`Trust ${p.name}?`, [
+    "This answers the server's “Trust this folder?” prompt with yes.",
+    "Claude Code will then run this project's hooks, MCP servers and settings.",
+  ], "Trust").then((ok) => ok && act("t:" + p.name, "Trusting…",
+    () => api("POST", `/api/projects/${encodeURIComponent(p.name)}/trust`)));
+}
+async function restartServer(p) {
+  const fromApp = p.sessions.filter((x) => x.kind === "spawned").length;
+  const body = ["The daemon starts it again within a few seconds."];
+  if (fromApp) body.unshift(h("p", { style: "margin:0;color:var(--bad)",
+    text: `This ends ${fromApp} session${fromApp > 1 ? "s" : ""} it is serving (they are archived in the app).` }));
+  if (await confirmBox(`Restart ${p.name}'s server?`, body, "Restart server"))
+    act("r:" + p.name, "Restarting…", () => api("POST", `/api/projects/${encodeURIComponent(p.name)}/restart`));
+}
+
+let screenProject = "";
+async function showScreen(name) {
+  screenProject = name;
+  $("scTitle").textContent = name;
+  $("scScreen").textContent = "loading…";
+  $("scExitWrap").hidden = true;
+  if (!$("screenDlg").open) $("screenDlg").showModal();
+  try {
+    const r = await api("GET", `/api/projects/${encodeURIComponent(name)}/screen`);
+    $("scScreen").textContent = r.screen || (r.running ? "(blank)" : "(not running)");
+    $("scScreen").scrollTop = $("scScreen").scrollHeight;
+    $("scExit").textContent = r.exit_log;
+    $("scExitWrap").hidden = !r.exit_log;
+  } catch (e) { $("scScreen").textContent = e.message; }
+}
+$("scRefresh").onclick = () => showScreen(screenProject);
+$("scClose").onclick = () => $("screenDlg").close();
+
+// ---- new session
+function updateHere() {
+  const p = state && state.projects.find((x) => x.name === $("nsProject").value);
+  const forced = p && !(p.git && p.has_commit);
+  $("nsHere").disabled = !!forced;
+  if (forced) $("nsHere").checked = true;
+  $("nsHereHint").textContent = !p ? "" : !p.git ? "Not a git repo, so the session works in the project folder." :
+    !p.has_commit ? "This repo has no commits yet, so a worktree can't be made from it." : "";
+}
+function openNew(project) {
+  if (!state) return;
+  const recent = store.get("crpm-recent", []);
+  const names = state.projects.map((p) => p.name);
+  const ordered = [...recent.filter((n) => names.includes(n)), ...names.filter((n) => !recent.includes(n))];
+  const sel = $("nsProject");
+  sel.replaceChildren(...ordered.map((n, i) => h("option", { value: n, text: n })));
+  if (recent.length && ordered.length > recent.length)
+    sel.insertBefore(h("option", { disabled: true, text: "──────────" }), sel.options[recent.filter((n) => names.includes(n)).length]);
+  sel.value = project || ordered[0] || "";
+  $("nsPrompt").value = ""; $("nsName").value = ""; $("nsHere").checked = false;
+  $("nsResult").replaceChildren();
+  $("nsGo").disabled = false; $("nsGo").replaceChildren("Start session");
+  updateHere();
+  $("newDlg").showModal();
+  setTimeout(() => $("nsPrompt").focus(), 50);
+}
+$("nsProject").onchange = updateHere;
+$("nsCancel").onclick = () => $("newDlg").close();
+$("newForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const body = { project: $("nsProject").value, prompt: $("nsPrompt").value, name: $("nsName").value, here: $("nsHere").checked };
+  store.set("crpm-recent", [body.project, ...store.get("crpm-recent", []).filter((n) => n !== body.project)].slice(0, 5));
+  $("nsGo").disabled = true;
+  $("nsGo").replaceChildren(h("span", { class: "spin" }), "Starting… (up to 45 s)");
+  $("nsResult").replaceChildren();
+  try {
+    const r = await api("POST", "/api/sessions", body);
+    $("nsResult").replaceChildren(h("div", { class: "result" },
+      h("div", {}, "Connected: ", h("a", { href: r.url, target: "_blank", rel: "noopener noreferrer", text: r.name })),
+      h("div", { class: "mono", style: "font-size:12px;margin-top:4px", text: r.folder })));
+    $("nsGo").replaceChildren("Start another");
+    refresh();
+  } catch (err) {
+    $("nsResult").replaceChildren(h("div", { class: "result err", text: err.message }));
+    $("nsGo").replaceChildren("Try again");
+  } finally { $("nsGo").disabled = false; }
+};
+
+// ---- rendering
+function renderLogin(msg) {
+  clearTimeout(pollTimer);
+  const input = h("input", { type: "password", placeholder: "Token", autocomplete: "current-password", required: true });
+  $("app").replaceChildren(h("div", { class: "wrap" },
+    h("form", { class: "login dlg", onsubmit: (e) => { e.preventDefault(); token = input.value.trim(); store.set("crpm-token", token); boot(); } },
+      h("h2", { text: "crpm" }),
+      h("div", { class: "hint", text: "Open the login link printed by `crpm web-token`, or paste its token here." }),
+      msg && msg !== "not logged in" ? h("div", { class: "result err", text: msg }) : null,
+      input,
+      h("div", { class: "row" }, h("button", { class: "primary", type: "submit", text: "Log in" })))));
+}
+
+let filterInput = null;
+function render() {
+  if (!token) return renderLogin();
+  const stale = !lastOk || Date.now() - lastOk > POLL_MS * 3;
+  if (!filterInput) {
+    filterInput = h("input", { type: "search", placeholder: "Filter projects", "aria-label": "Filter projects",
+      oninput: (e) => { filter = e.target.value.toLowerCase(); render(); } });
+  }
+  const projects = state ? state.projects.filter((p) => p.name.toLowerCase().includes(filter)) : [];
+  const rank = (p) => attention(p) ? 0 : p.sessions.length ? 1 : 2;
+  projects.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  const active = projects.filter((p) => rank(p) < 2), rest = projects.filter((p) => rank(p) === 2);
+
+  const focused = document.activeElement === filterInput;
+  const wrap = h("div", { class: "wrap" },
+    h("header", {},
+      h("div", { class: "bar" },
+        h("span", { class: "brand", text: "crpm" }),
+        h("span", { class: "host", text: state ? state.host : "" }),
+        h("span", { class: "spacer" }),
+        h("span", { class: "live" + (stale ? " stale" : ""), title: loadError || "" },
+          h("i"), stale ? (lastOk ? "updated " + ago(lastOk / 1000) : "connecting…") : "live")),
+      h("div", { class: "tools" }, filterInput,
+        h("button", { class: "primary", disabled: !state, onclick: () => openNew(), text: "New session" }))),
+    loadError ? h("div", { class: "banner", text: "Can't reach crpm: " + loadError }) : null,
+    !state ? h("div", { class: "empty", style: "padding:24px 0", text: loadError ? "" : "Loading…" }) : [
+      active.length ? h("div", { class: "section-title", text: "Active" }) : null,
+      h("div", { class: "list" }, active.map(projectCard)),
+      rest.length ? h("div", { class: "section-title", text: active.length ? "Other projects" : "Projects" }) : null,
+      h("div", { class: "list" }, rest.map(projectCard)),
+      !projects.length ? h("div", { class: "empty", style: "padding:16px 0", text: "No projects match." }) : null,
+      state.other_sessions.length ? [
+        h("div", { class: "section-title", text: "Sessions outside your projects" }),
+        h("div", { class: "proj body", style: "border:1px solid var(--border);border-radius:var(--radius);background:var(--panel)" },
+          state.other_sessions.map((s) => sessionRow(s, null)))] : null,
+    ]);
+  $("app").replaceChildren(wrap);
+  if (focused) { filterInput.focus(); }
+}
+
+function boot() { render(); refresh(); }
+if (token) boot(); else renderLogin();
+</script>
+</body>
+</html>

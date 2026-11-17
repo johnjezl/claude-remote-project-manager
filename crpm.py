@@ -16,23 +16,31 @@ Subcommands:
   restart-session   restart idle sessions so they load new settings, MCP servers, etc.
   new-session       start a new Remote Control session in a project (in its own worktree)
   stop-all          shut down every managed remote-control server
+  web               serve the web dashboard (what crpm-web.service runs)
+  web-token [USER]  create (or replace) a web dashboard login token
 """
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import getpass
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 log = logging.getLogger("crpm")
 
@@ -63,6 +71,9 @@ DEFAULTS = {
     "stop_timeout": 10,
     "log_dir": "~/.local/state/crpm",  # <session>.exit.log: exit status + last screen of servers that exited
     "exit_log_lines": 80,
+    # web dashboard (crpm web). Keep it on loopback and reach it through `tailscale serve`
+    # or an SSH tunnel: anyone who can use it can run Claude in your projects.
+    "web_listen": "127.0.0.1:8765",
 }
 
 
@@ -1012,6 +1023,281 @@ def cmd_stop_all(cfg: dict, _a) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- web dashboard
+# Auth is per user from the start: the tokens file maps each token (stored hashed) to a user, every
+# API call runs as that User and is logged with its name. One line in the file today; more users,
+# or an identity from `tailscale serve` headers, can be added without changing the API.
+
+WEB_TOKENS = CONFIG_PATH.parent / "web-tokens"   # lines: "<user> <sha256 of token>"
+WEB_PAGE = Path(os.path.realpath(__file__)).with_name("crpm_web.html")
+WEB_MAX_BODY = 64 * 1024
+RECONNECT_SHOW = 24 * 3600  # older stopped sessions are past Claude Code's ~4h reattach window anyway
+USER_NAME = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+
+
+@dataclass(frozen=True)
+class User:
+    name: str
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def load_tokens() -> dict[str, User]:
+    """{sha256(token): User}. Read per request, so `crpm web-token` applies without a restart."""
+    out = {}
+    try:
+        text = WEB_TOKENS.read_text()
+    except FileNotFoundError:
+        return out
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and not line.startswith("#"):
+            out[parts[1]] = User(parts[0])
+    return out
+
+
+def write_tokens(lines: list[str]) -> None:
+    WEB_TOKENS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = WEB_TOKENS.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("".join(l + "\n" for l in lines))
+    os.replace(tmp, WEB_TOKENS)
+
+
+def set_token(user: str, revoke: bool = False) -> str:
+    """Give `user` a new token (replacing any old one), or just remove theirs. Returns the token."""
+    if not USER_NAME.match(user):
+        raise CrpmError(f"invalid user name {user!r}")
+    try:
+        lines = WEB_TOKENS.read_text().splitlines()
+    except FileNotFoundError:
+        lines = ["# crpm web dashboard logins: <user> <sha256 of token>. Manage with `crpm web-token`."]
+    lines = [l for l in lines if l.split()[:1] != [user]]
+    token = "" if revoke else secrets.token_urlsafe(32)
+    if token:
+        lines.append(f"{user} {token_hash(token)}")
+    write_tokens(lines)
+    return token
+
+
+def parse_listen(listen: str) -> tuple[str, int]:
+    host, _, port = listen.rpartition(":")
+    return host.strip("[]") or "127.0.0.1", int(port)
+
+
+def web_project(cfg: dict, name: str) -> str:
+    """A project the API may act on: a folder in projects_dir, or a running server. Names only, never paths."""
+    if name in {p.name for p in project_dirs(cfg)} | {s.project for s in servers(cfg)}:
+        return name
+    raise CrpmError(f"no project {name!r}")
+
+
+def session_json(cfg: dict, s: LiveSession) -> dict:
+    root = cfg["projects_dir"]
+    rel = Path(*s.cwd.relative_to(root).parts[1:]) if root in s.cwd.parents else s.cwd  # within its project
+    wt = bridge_worktree(s.cwd)
+    parts = s.cwd.parts
+    worktree = wt[0].name if wt else (parts[parts.index("worktrees") + 1]
+                                      if ".claude" in parts and "worktrees" in parts[:-1] else "")
+    return {"key": s.key, "session_id": s.session_id, "remote": bool(s.session_id),
+            "url": f"https://claude.ai/code/{s.session_id}" if s.session_id else "",
+            "name": s.name, "kind": s.kind, "status": s.status, "pid": s.pid,
+            "folder": str(rel), "worktree": worktree, "tmux": s.tmux}
+
+
+def api_status(cfg: dict, user: User, _body: dict) -> dict:
+    root = cfg["projects_dir"]
+    by_name = {s.project: s for s in servers(cfg)}
+    projects: dict[str, dict] = {}
+    for p in project_dirs(cfg):
+        projects[p.name] = {"name": p.name, "path": str(p), "git": (p / ".git").exists(),
+                            "server": None, "sessions": [], "reconnectable": []}
+    for name, s in by_name.items():
+        projects.setdefault(name, {"name": name, "path": s.path, "git": s.mode == "worktree",
+                                   "sessions": [], "reconnectable": []})["server"] = asdict(s)
+    for p in projects.values():
+        # new-session needs a commit for a worktree; a server in worktree mode implies one
+        p["has_commit"] = p["git"] and ((p["server"] or {}).get("mode") == "worktree"
+                                        or git_has_commit(Path(p["path"])))
+    other = []
+    for s in live_sessions(include_local=True):
+        top = s.cwd.relative_to(root).parts[0] if root in s.cwd.parents else None
+        (projects[top]["sessions"] if top in projects else other).append(session_json(cfg, s))
+    for r in reconnect_candidates(cfg):
+        if r.project in projects and time.time() - r.last_active < RECONNECT_SHOW:
+            projects[r.project]["reconnectable"].append(asdict(r))
+    return {"user": user.name, "host": socket.gethostname(), "time": time.time(),
+            "projects": list(projects.values()), "other_sessions": other}
+
+
+def api_screen(cfg: dict, _user: User, _body: dict, project: str) -> dict:
+    return project_screen(cfg, web_project(cfg, project))
+
+
+def api_restart_project(cfg: dict, _user: User, _body: dict, project: str) -> dict:
+    return {"message": restart_project(cfg, web_project(cfg, project))}
+
+
+def api_trust(cfg: dict, _user: User, _body: dict, project: str) -> dict:
+    return {"message": trust_project(cfg, web_project(cfg, project))}
+
+
+def api_new_session(cfg: dict, _user: User, body: dict) -> dict:
+    project = cfg["projects_dir"] / web_project(cfg, str(body.get("project") or ""))
+    name = str(body.get("name") or "").strip() or None
+    prompt = str(body.get("prompt") or "").strip() or None
+    return asdict(new_session(cfg, project, prompt, name, bool(body.get("here"))))
+
+
+def api_restart_session(cfg: dict, _user: User, body: dict, key: str) -> dict:
+    s = next((s for s in live_sessions(include_local=True) if key in (s.session_id, s.conversation)), None)
+    if not s:
+        raise CrpmError(f"no running session {key}")
+    if s.status != "idle" and not body.get("force"):
+        raise CrpmError(f"{s.name or key} is {s.status}; wait for it to finish, or force the restart")
+    if is_ancestor(s.pid):
+        raise CrpmError("this dashboard runs inside that session; restart it from the CLI")
+    return {"message": restart_session(cfg, s)}
+
+
+def api_reconnect(cfg: dict, _user: User, _body: dict, session_id: str) -> dict:
+    sid = f"session_{short_id(session_id)}"
+    return {"message": reconnect_session(cfg, find_bridge_worktree(cfg, sid), sid)}
+
+
+WEB_ROUTES = [
+    ("GET", r"/api/status", api_status),
+    ("GET", r"/api/projects/([^/]+)/screen", api_screen),
+    ("POST", r"/api/projects/([^/]+)/restart", api_restart_project),
+    ("POST", r"/api/projects/([^/]+)/trust", api_trust),
+    ("POST", r"/api/sessions", api_new_session),
+    ("POST", r"/api/sessions/([^/]+)/restart", api_restart_session),
+    ("POST", r"/api/sessions/([^/]+)/reconnect", api_reconnect),
+]
+
+PAGE_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                               "connect-src 'self'; img-src data:; manifest-src 'self'; base-uri 'none'; "
+                               "form-action 'none'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+
+
+def make_handler(cfg: dict):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "crpm"
+
+        def log_message(self, fmt, *args):  # never log headers (the token is in one)
+            log.debug("web %s " + fmt, self.address_string(), *args)
+
+        def send(self, code: int, body: bytes, ctype: str) -> None:
+            self.send_response(code)
+            for k, v in PAGE_HEADERS.items():
+                self.send_header(k, v)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_json(self, code: int, data: dict) -> None:
+            self.send(code, json.dumps(data).encode(), "application/json")
+
+        def user(self) -> User | None:
+            auth = self.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                return None
+            return load_tokens().get(token_hash(auth[7:].strip()))
+
+        def handle_request(self, method: str) -> None:
+            path = urlsplit(self.path).path
+            if method == "GET" and path in ("/", "/index.html"):
+                try:
+                    return self.send(200, WEB_PAGE.read_bytes(), "text/html; charset=utf-8")
+                except OSError:
+                    return self.send(500, b"crpm_web.html is missing", "text/plain")
+            for m, pattern, fn in WEB_ROUTES:
+                match = re.fullmatch(pattern, path)
+                if m == method and match:
+                    break
+            else:
+                return self.send_json(404, {"error": "not found"})
+            user = self.user()
+            if not user:
+                return self.send_json(401, {"error": "not logged in"})
+            body: dict = {}
+            if method == "POST":
+                origin = self.headers.get("Origin")
+                if origin and urlsplit(origin).netloc != self.headers.get("Host"):
+                    return self.send_json(403, {"error": "cross-origin request"})
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > WEB_MAX_BODY:
+                    return self.send_json(413, {"error": "request too large"})
+                try:
+                    body = json.loads(self.rfile.read(n) or b"{}")
+                    assert isinstance(body, dict)
+                except (ValueError, AssertionError):
+                    return self.send_json(400, {"error": "body must be a JSON object"})
+                log.info("web %s: %s %s %s", user.name, method, path,
+                         json.dumps({k: v for k, v in body.items() if k != "prompt"}))
+            try:
+                self.send_json(200, fn(cfg, user, body, *(unquote(g) for g in match.groups())))
+            except CrpmError as e:
+                if method == "POST":
+                    log.info("web %s: %s %s failed: %s", user.name, method, path, e)
+                self.send_json(400, {"error": str(e)})
+            except Exception as e:
+                log.exception("web %s %s failed", method, path)
+                self.send_json(500, {"error": f"internal error: {e}"})
+
+        def do_GET(self):
+            self.handle_request("GET")
+
+        def do_POST(self):
+            self.handle_request("POST")
+
+    return Handler
+
+
+def cmd_web(cfg: dict, a) -> int:
+    host, port = parse_listen(a.listen or cfg["web_listen"])
+    if not load_tokens():
+        raise CrpmError("no logins yet: run `crpm web-token` to create one")
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        log.warning("listening on %s: anyone who can reach it and has a token can run Claude here. "
+                    "Prefer 127.0.0.1 plus `tailscale serve` or an SSH tunnel.", host)
+    ThreadingHTTPServer.address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    httpd = ThreadingHTTPServer((host, port), make_handler(cfg))
+    httpd.daemon_threads = True
+    def on_term(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_term)
+    log.info("web dashboard on http://%s:%d/", host, port)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        log.info("web dashboard stopping")
+    return 0
+
+
+def cmd_web_token(cfg: dict, a) -> int:
+    user = a.user or getpass.getuser()
+    token = set_token(user, revoke=a.revoke)
+    if a.revoke:
+        print(f"removed {user}'s login")
+        return 0
+    host, port = parse_listen(cfg["web_listen"])
+    print(f"login for {user} (replaces any earlier one; shown only now):\n"
+          f"  http://{'localhost' if host in ('127.0.0.1', '::1') else host}:{port}/#token={token}\n"
+          f"Through `tailscale serve`, open https://<this machine>.<tailnet>.ts.net/#token={token}\n"
+          f"Or paste the token on the login page: {token}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="crpm", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1040,6 +1326,11 @@ def main(argv=None) -> int:
     for n in ("attach", "restart"):
         sp = sub.add_parser(n)
         sp.add_argument("project")
+    wb = sub.add_parser("web", help="serve the web dashboard")
+    wb.add_argument("--listen", help="host:port (default: web_listen in the config, 127.0.0.1:8765)")
+    wt = sub.add_parser("web-token", help="create or replace a web dashboard login")
+    wt.add_argument("user", nargs="?", help="user name (default: your login name)")
+    wt.add_argument("--revoke", action="store_true", help="remove the user's login instead")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(levelname)s %(message)s" if os.environ.get("INVOCATION_ID")
@@ -1051,7 +1342,8 @@ def main(argv=None) -> int:
     try:
         return {"status": cmd_status, "attach": cmd_attach, "restart": cmd_restart,
                 "reconnect": cmd_reconnect, "restart-session": cmd_restart_session,
-                "new-session": cmd_new_session, "stop-all": cmd_stop_all}[a.cmd](cfg, a)
+                "new-session": cmd_new_session, "stop-all": cmd_stop_all,
+                "web": cmd_web, "web-token": cmd_web_token}[a.cmd](cfg, a)
     except CrpmError as e:
         print(f"crpm {a.cmd}: {e}", file=sys.stderr)
         return 1

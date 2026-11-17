@@ -1,0 +1,17 @@
+[Unit]
+Description=crpm web dashboard (start sessions, restart servers, answer trust prompts from a browser)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/crpm web
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+# Sessions started from the dashboard run in the crpm tmux server, which this process may
+# have launched. Only kill the web server itself, so restarting it never ends a session.
+KillMode=process
+
+[Install]
+WantedBy=default.target

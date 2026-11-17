@@ -48,7 +48,8 @@ To have crpm start at boot without logging in, enable linger: `sudo loginctl ena
 crpm status                     # project, state, sessions in use/capacity, spawn mode, path
 crpm attach sd-mux              # watch or answer a project's remote-control TUI (detach: Ctrl-b d)
 crpm restart sd-mux             # bounce one project
-crpm reconnect                  # from a session's worktree: bring that session back in tmux
+crpm reconnect [SESSION_ID]     # bring a session back in tmux after its server stopped
+                                #   (no ID: the session whose worktree you're in)
 crpm new-session PROJECT ["first message"] [-n NAME] [--here]
                                 # new Remote Control session in its own worktree; prints its claude.ai link
 crpm restart-session [ID...]    # restart idle sessions to load new settings/MCP servers/etc.
@@ -56,13 +57,39 @@ crpm restart-session [ID...]    # restart idle sessions to load new settings/MCP
 crpm stop-all                   # stop every server (the daemon restarts them unless it is stopped too)
 journalctl --user -u crpm -f    # daemon log
 tmux -L crpm ls                 # raw tmux view
+crpm web-token [USER]           # create/replace a web dashboard login (--revoke to remove it)
 ```
+
+## Web dashboard
+
+`crpm-web.service` serves a dashboard at <http://localhost:8765> that does what the CLI does,
+from any browser, including your phone:
+
+* every project with its server state, and the sessions running in it (open them in claude.ai)
+* **New session**: pick a project, type the first message, get the claude.ai link
+* **Trust** a project waiting on its first-run trust prompt, without `crpm attach`
+* restart a project's server, restart a session (or put a local session on Remote Control),
+  reconnect a session whose server stopped, view a server's screen and last exit log
+
+**Logging in.** `install.sh` prints a login link the first time. `crpm web-token` makes a new one
+(and invalidates the old one); the token is in the link's `#fragment`, so it never reaches server
+logs. Tokens are stored hashed in `~/.config/crpm/web-tokens`, one line per user.
+
+**From other devices.** The dashboard listens on 127.0.0.1 only: anyone who can use it can run
+Claude in your projects. To reach it from your phone or laptop, use one of these:
+
+* **Tailscale** (HTTPS, only your tailnet's devices can reach it):
+  `tailscale serve --bg 8765`, then open `https://<this machine>.<tailnet>.ts.net/#token=…`
+* **SSH tunnel**: `ssh -L 8765:localhost:8765 <this machine>`, then <http://localhost:8765>
+
+`web_listen` in the config changes the address; listening anywhere but loopback logs a warning.
 
 ## Uninstall
 
 ```bash
 systemctl --user disable --now crpm && crpm stop-all
-rm ~/.config/systemd/user/crpm.service ~/.local/bin/crpm
+systemctl --user disable --now crpm-web
+rm ~/.config/systemd/user/crpm.service ~/.config/systemd/user/crpm-web.service ~/.local/bin/crpm
 ```
 
 ## Notes
