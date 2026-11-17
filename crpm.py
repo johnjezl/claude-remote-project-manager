@@ -85,13 +85,13 @@ class Tmux:
         return subprocess.run(["tmux", "-L", self.socket, *args],
                               capture_output=True, text=True, check=check)
 
-    FIELDS = ("path", "mode", "cmd", "dead", "status", "signal", "retained", "pid")
+    FIELDS = ("path", "mode", "cmd", "dead", "status", "signal", "retained", "pid", "created")
 
     def sessions(self, prefix: str) -> dict[str, dict]:
-        """Managed sessions -> {name: {path, mode, cmd, dead, status, signal, retained, pid}}."""
+        """Managed sessions -> {name: {path, mode, cmd, dead, status, signal, retained, pid, created}}."""
         fmt = "\t".join(["#{session_name}", "#{@crpm_path}", "#{@crpm_mode}", "#{@crpm_cmd}",
                          "#{pane_dead}", "#{pane_dead_status}", "#{pane_dead_signal}",
-                         "#{remain-on-exit}", "#{pane_pid}"])
+                         "#{remain-on-exit}", "#{pane_pid}", "#{session_created}"])
         r = self.run("list-sessions", "-F", fmt)
         out = {}
         if r.returncode != 0:  # no server running
@@ -159,6 +159,14 @@ def screen_state(screen: str) -> str:
     return "starting/unknown"
 
 
+def excluded(cfg: dict, name: str) -> bool:
+    return any(fnmatch.fnmatch(name, pat) for pat in cfg["exclude"])
+
+
+def claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+
+
 def session_name(prefix: str, project: str) -> str:
     # tmux forbids '.' and ':' in session names
     return prefix + re.sub(r"[^A-Za-z0-9_-]", "_", project)
@@ -210,7 +218,7 @@ class Manager:
         for p in entries:
             if not p.is_dir():
                 continue
-            if any(fnmatch.fnmatch(p.name, pat) for pat in self.cfg["exclude"]):
+            if excluded(self.cfg, p.name):
                 continue
             seen.add(p.name)
             sname = session_name(self.cfg["session_prefix"], p.name)
@@ -415,38 +423,100 @@ class Manager:
                 time.sleep(0.1)
 
 
-# --------------------------------------------------------------------------- CLI
+# --------------------------------------------------------------------------- operations
+# Each operation returns data (or a message saying what it did) and raises CrpmError when it
+# can't. The CLI and the web dashboard are thin layers over these, so both behave the same.
+
+class CrpmError(Exception):
+    pass
+
 
 def resolve(cfg: dict, project: str) -> str:
     return project if project.startswith(cfg["session_prefix"]) else session_name(cfg["session_prefix"], project)
 
 
-def cmd_status(cfg: dict, _a) -> int:
+def project_dirs(cfg: dict) -> list[Path]:
+    """Folders in projects_dir that crpm manages (or would, once they settle)."""
+    try:
+        entries = sorted(cfg["projects_dir"].iterdir(), key=lambda p: p.name.lower())
+    except FileNotFoundError:
+        return []
+    return [p for p in entries if p.is_dir() and not excluded(cfg, p.name)]
+
+
+@dataclass
+class Server:
+    """A project's `claude remote-control` server (tmux session rc-<project>)."""
+    tmux: str
+    project: str
+    path: str
+    mode: str
+    state: str
+    capacity: str
+    pid: int
+    created: int
+    dead: bool
+
+
+def servers(cfg: dict) -> list[Server]:
     t = Tmux(cfg["tmux_socket"])
-    have = t.sessions(cfg["session_prefix"])
-    if not have:
-        print("no managed sessions running")
-        return 0
-    for name, info in sorted(have.items()):
+    out = []
+    for name, info in sorted(t.sessions(cfg["session_prefix"]).items()):
         screen = t.capture(name)
         if info["dead"]:
             state = f"exited ({'signal ' + info['signal'] if info['signal'] else 'status ' + info['status']})"
         else:
             state = screen_state(screen)
         cap = re.search(r"Capacity: (\d+/\d+)", screen)
-        print(f"{name:40} {state:26} {cap.group(1) if cap else '':8} {info['mode']:9} {info['path']}")
-    return 0
+        project = Path(info["path"]).name if info["path"] else name.removeprefix(cfg["session_prefix"])
+        out.append(Server(name, project, info["path"], info["mode"], state, cap.group(1) if cap else "",
+                          int(info["pid"] or 0), int(info["created"] or 0), info["dead"]))
+    return out
 
 
-def cmd_attach(cfg: dict, a) -> int:
-    os.execvp("tmux", ["tmux", "-L", cfg["tmux_socket"], "attach", "-t", resolve(cfg, a.project)])
+def restart_project(cfg: dict, project: str) -> str:
+    name = resolve(cfg, project)
+    if not Tmux(cfg["tmux_socket"]).has(name):
+        raise CrpmError(f"no server {name} is running")
+    Manager(cfg).stop(name)
+    return "stopped; the daemon will start it again within a few seconds"
 
 
-def cmd_restart(cfg: dict, a) -> int:
-    m = Manager(cfg)
-    m.stop(resolve(cfg, a.project))
-    print("stopped; the daemon will start it again within a few seconds")
-    return 0
+def trust_project(cfg: dict, project: str) -> str:
+    """Answer a project server's first-run `Trust <folder>? [y/N]` prompt with y."""
+    t, name = Tmux(cfg["tmux_socket"]), resolve(cfg, project)
+    if not t.has(name) or t.is_dead(name):
+        raise CrpmError(f"no server {name} is running")
+    if screen_state(t.capture(name)) != "WAITING FOR TRUST PROMPT":
+        raise CrpmError(f"{name} is not waiting for a trust prompt")
+    t.send(name, "y", "Enter")
+    return f"answered y; {name} should connect in a few seconds"
+
+
+def tail_lines(text: str, n: int) -> str:
+    lines: list[str] = []
+    for l in text.splitlines():  # collapse the pane's padding: no runs of blank lines
+        l = l.rstrip()
+        if l or (lines and lines[-1]):
+            lines.append(l)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines[-n:])
+
+
+def project_screen(cfg: dict, project: str, lines: int = 200) -> dict:
+    """A project server's current screen, and the end of its exit log (why it last exited)."""
+    t, name = Tmux(cfg["tmux_socket"]), resolve(cfg, project)
+    screen = tail_lines(t.capture(name, history=lines), lines) if t.has(name) else ""
+    exit_log = ""
+    path = Path(cfg["log_dir"]).expanduser() / f"{name}.exit.log"
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - 32768))
+            exit_log = tail_lines(f.read().decode(errors="replace"), 120)
+    except OSError:
+        pass
+    return {"tmux": name, "running": t.has(name), "screen": screen, "exit_log": exit_log}
 
 
 # Must not start with session_prefix: the daemon stops any such session that isn't a project.
@@ -464,71 +534,125 @@ def bridge_worktree(start: Path) -> tuple[Path, str] | None:
     return None
 
 
+def short_id(session_id: str) -> str:
+    return session_id.removeprefix("session_").removeprefix("cse_")
+
+
 def serving_pid(session_id: str) -> int | None:
     """PID of a local process already serving this session, if any."""
     for proc in Path("/proc").glob("[0-9]*"):
-        try:
-            argv = (proc / "cmdline").read_bytes().decode(errors="replace").split("\0")
-        except OSError:
-            continue
+        argv = proc_argv(int(proc.name))
         if "remote-control" in argv and "--session-id" in argv and session_id in argv:
             return int(proc.name)
-    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
-    for record in (config_dir / "sessions").glob("*.json"):
-        try:
-            data = json.loads(record.read_text())
-            if data.get("bridgeSessionId") == session_id and Path(f"/proc/{int(data['pid'])}").exists():
-                return int(data["pid"])
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
+    for s in live_sessions():
+        if s.session_id == session_id:
+            return s.pid
     return None
 
 
-def launch_detached(cfg: dict, name: str, cwd: Path, cmd: str, what: str, hint: str = "") -> int:
-    """Run `cmd` in a new reconnect- tmux session (which the daemon ignores) and check it stays up."""
+def served_session_ids() -> set[str]:
+    """Every session some local process is serving right now (serving_pid, for all sessions at once)."""
+    ids = {s.session_id for s in live_sessions()}
+    for proc in Path("/proc").glob("[0-9]*"):
+        argv = proc_argv(int(proc.name))
+        if "remote-control" in argv and "--session-id" in argv:
+            i = argv.index("--session-id")
+            if i + 1 < len(argv):
+                ids.add(argv[i + 1])
+    return ids
+
+
+def launch_detached(cfg: dict, name: str, cwd: Path, cmd: str, what: str, hint: str = "") -> str:
+    """Run `cmd` in a new tmux session the daemon ignores (not session_prefix) and check it stays up."""
     t = Tmux(cfg["tmux_socket"])
     attach = f"tmux -L {cfg['tmux_socket']} attach -t {name}"
     if t.has(name):
         if not t.is_dead(name):
-            print(f"{what} is already running in tmux: {attach}")
-            return 0
+            return f"{what} is already running in tmux: {attach}"
         t.kill(name)  # dead pane left by an older crpm
     if not t.new_session(name, str(cwd), cmd, {}, retain=False):
-        return 1
+        raise CrpmError(f"could not start tmux session {name}")
     time.sleep(RECONNECT_SETTLE)
     if not t.has(name):
-        print(f"crpm: claude exited right away. To see why, run this in {cwd}:\n  {cmd}" +
-              (f"\n{hint}" if hint else ""), file=sys.stderr)
-        return 1
-    print(f"started {what}\n  watch: {attach}  (detach: Ctrl-b d)")
-    return 0
+        raise CrpmError(f"claude exited right away. To see why, run this in {cwd}:\n  {cmd}" +
+                        (f"\n{hint}" if hint else ""))
+    return f"started {what}\n  watch: {attach}  (detach: Ctrl-b d)"
 
 
 def reconnect_name(project: str, session_id: str) -> str:
-    return session_name(RECONNECT_PREFIX, f"{project}-{session_id.removeprefix('session_')}")
+    return session_name(RECONNECT_PREFIX, f"{project}-{short_id(session_id)}")
 
 
-def cmd_reconnect(cfg: dict, _a) -> int:
-    found = bridge_worktree(Path.cwd())
-    if not found:
-        print("crpm reconnect: run this from inside a session worktree (.claude/worktrees/bridge-cse_*)",
-              file=sys.stderr)
-        return 1
-    worktree, session_id = found
+def find_bridge_worktree(cfg: dict, session_id: str) -> Path:
+    short = short_id(session_id)
+    if not re.fullmatch(r"[A-Za-z0-9]+", short):
+        raise CrpmError(f"not a session ID: {session_id}")
+    hits = sorted(cfg["projects_dir"].glob(f"*/.claude/worktrees/bridge-cse_{short}"))
+    if not hits:
+        raise CrpmError(f"no worktree for session_{short} under {cfg['projects_dir']}")
+    return hits[0]
+
+
+def reconnect_session(cfg: dict, worktree: Path, session_id: str) -> str:
+    """Serve a spawned session again, from its worktree, after its project's server stopped."""
     name = reconnect_name(worktree.parents[2].name, session_id)
     t = Tmux(cfg["tmux_socket"])
     if not (t.has(name) and not t.is_dead(name)):
         pid = serving_pid(session_id)
         if pid:
-            print(f"crpm reconnect: {session_id} is already being served by PID {pid}. "
-                  "Stop that process first if it is stuck.", file=sys.stderr)
-            return 1
+            raise CrpmError(f"{session_id} is already being served by PID {pid}. "
+                            "Stop that process first if it is stuck.")
     cmd = shlex.join([cfg["claude_bin"], "remote-control", "--session-id", session_id])
     return launch_detached(cfg, name, worktree, cmd, f"remote-control for {session_id}",
                            "Claude Code can only reattach for about 4 hours after the session's server stopped.")
 
 
-# --------------------------------------------------------------------------- restart-session
+def transcript_mtime(cwd: Path) -> float | None:
+    """When Claude last wrote a transcript for a session run in `cwd`."""
+    d = claude_config_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    times = []
+    for f in d.glob("*.jsonl"):
+        try:
+            times.append(f.stat().st_mtime)
+        except OSError:
+            pass
+    return max(times, default=None)
+
+
+@dataclass
+class Reconnectable:
+    project: str
+    session_id: str
+    worktree: str
+    last_active: float
+
+
+def reconnect_candidates(cfg: dict) -> list[Reconnectable]:
+    """Spawned-session worktrees that nothing serves and whose server no longer knows them.
+
+    A project's server serves its own spawned sessions again on their next message, so only
+    worktrees made before that server started (i.e. by an earlier server) need a reconnect."""
+    served = served_session_ids()
+    started = {Path(i["path"]).name: int(i["created"] or 0)
+               for i in Tmux(cfg["tmux_socket"]).sessions(cfg["session_prefix"]).values()
+               if not i["dead"] and i["path"]}
+    out = []
+    for wt in cfg["projects_dir"].glob("*/.claude/worktrees/bridge-cse_*"):
+        found = bridge_worktree(wt)
+        if not found or found[1] in served:
+            continue
+        project = wt.parents[2].name
+        try:
+            made = (wt / ".git").stat().st_mtime
+        except OSError:
+            continue  # not (or no longer) a worktree
+        if started.get(project, float("inf")) <= made:
+            continue
+        out.append(Reconnectable(project, found[1], str(wt), transcript_mtime(wt) or made))
+    return sorted(out, key=lambda r: -r.last_active)
+
+
+# --------------------------------------------------------------------------- live sessions
 
 RESTART_GAP = 2.0  # seconds between the old process exiting and the new one starting
 
@@ -536,23 +660,31 @@ RESTART_GAP = 2.0  # seconds between the old process exiting and the new one sta
 @dataclass
 class LiveSession:
     pid: int
-    session_id: str     # session_... (claude.ai)
+    session_id: str     # session_... (claude.ai); "" for a local session not on Remote Control
     conversation: str   # local transcript ID, for --resume
     cwd: Path
     status: str         # "idle" | "busy"
     parent_pid: int
     parent_argv: list[str]
+    name: str = ""      # the session's name in Claude Code
+    tmux: str = ""      # tmux session it runs in, if any
 
     @property
     def kind(self) -> str:
         """spawned: created by a project's `remote-control` server, which serves it again on the next message.
         reattached: served by `remote-control --session-id/--continue`, which exits with it.
-        terminal: an interactive `claude --remote-control` (or /remote-control) session."""
+        terminal: an interactive `claude --remote-control` (or /remote-control) session,
+        or a local session that isn't on Remote Control (restarting it puts it on)."""
         if "remote-control" in self.parent_argv:
             if {"--session-id", "--continue", "-c"} & set(self.parent_argv):
                 return "reattached"
             return "spawned"
         return "terminal"
+
+    @property
+    def key(self) -> str:
+        """Stable ID for any session: its claude.ai session ID, else its local conversation ID."""
+        return self.session_id or self.conversation
 
 
 def proc_start(pid: int) -> str | None:
@@ -578,21 +710,23 @@ def proc_ppid(pid: int) -> int:
         return 0
 
 
-def live_sessions() -> list[LiveSession]:
-    """Running Remote Control sessions, from Claude Code's per-process session records."""
-    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+def live_sessions(include_local: bool = False) -> list[LiveSession]:
+    """Running Remote Control sessions (plus local-only ones with include_local), from Claude
+    Code's per-process session records."""
     out = []
-    for record in sorted((config_dir / "sessions").glob("*.json")):
+    for record in sorted((claude_config_dir() / "sessions").glob("*.json")):
         try:
             d = json.loads(record.read_text())
             pid = int(d["pid"])
-            sid, conv, cwd = d["bridgeSessionId"], d["sessionId"], Path(d["cwd"])
+            sid, conv, cwd = d.get("bridgeSessionId") or "", d["sessionId"], Path(d["cwd"])
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        if not sid or proc_start(pid) != str(d.get("procStart")):
-            continue  # not a Remote Control session, or the process is gone (or its PID was reused)
+        if not (sid or include_local and d.get("kind") == "interactive") \
+                or proc_start(pid) != str(d.get("procStart")):
+            continue  # not a session we list, or the process is gone (or its PID was reused)
         ppid = proc_ppid(pid)
-        out.append(LiveSession(pid, sid, conv, cwd, d.get("status", "?"), ppid, proc_argv(ppid)))
+        out.append(LiveSession(pid, sid, conv, cwd, d.get("status", "?"), ppid, proc_argv(ppid),
+                               str(d.get("name") or ""), str(d.get("tmux") or "").split(":")[0]))
     return out
 
 
@@ -642,20 +776,16 @@ def find_pane(pid: int) -> tuple[str, str] | None:
     return None
 
 
-def restart_session(cfg: dict, s: LiveSession) -> int:
-    short = s.session_id.removeprefix("session_")
+def restart_session(cfg: dict, s: LiveSession) -> str:
     if s.kind == "spawned":
         if not terminate(s.pid):
-            print(f"  could not stop PID {s.pid}", file=sys.stderr)
-            return 1
-        print(f"  stopped. Send it a message from the app and its server starts it again with the new config.")
-        return 0
+            raise CrpmError(f"could not stop PID {s.pid}")
+        return "stopped. Send it a message from the app and its server starts it again with the new config."
 
     if s.kind == "reattached":
         server = s.parent_pid
         if not terminate(s.pid) or (proc_start(server) and not terminate(server)):
-            print(f"  could not stop PID {s.pid} / its server {server}", file=sys.stderr)
-            return 1
+            raise CrpmError(f"could not stop PID {s.pid} / its server {server}")
         time.sleep(RESTART_GAP)
         found = bridge_worktree(s.cwd)
         project = found[0].parents[2].name if found else s.cwd.name
@@ -671,35 +801,141 @@ def restart_session(cfg: dict, s: LiveSession) -> int:
         tm = ["tmux", "-S", sock]
         subprocess.run([*tm, "set-option", "-p", "-t", pane_id, "remain-on-exit", "on"], capture_output=True)
     if not terminate(s.pid):
-        print(f"  could not stop PID {s.pid}", file=sys.stderr)
-        return 1
+        raise CrpmError(f"could not stop PID {s.pid}")
     time.sleep(RESTART_GAP)
     if pane:
         r = subprocess.run([*tm, "respawn-pane", "-t", pane_id, "-c", str(s.cwd), cmd],
                            capture_output=True, text=True)
         subprocess.run([*tm, "set-option", "-p", "-u", "-t", pane_id, "remain-on-exit"], capture_output=True)
         if r.returncode != 0:
-            print(f"  respawn failed: {r.stderr.strip()}. Run in {s.cwd}:\n  {cmd}", file=sys.stderr)
-            return 1
+            raise CrpmError(f"respawn failed: {r.stderr.strip()}. Run in {s.cwd}:\n  {cmd}")
         time.sleep(RECONNECT_SETTLE)
         dead = subprocess.run([*tm, "display-message", "-p", "-t", pane_id, "#{pane_dead}"],
                               capture_output=True, text=True).stdout.strip()
         if dead != "0":
-            print(f"  claude exited right away. To see why, run in {s.cwd}:\n  {cmd}", file=sys.stderr)
-            return 1
+            raise CrpmError(f"claude exited right away. To see why, run in {s.cwd}:\n  {cmd}")
         name = subprocess.run([*tm, "display-message", "-p", "-t", pane_id, "#{session_name}"],
                               capture_output=True, text=True).stdout.strip()
-        print(f"  restarted in the same tmux pane: tmux -S {sock} attach -t {name}")
-        return 0
-    return launch_detached(cfg, reconnect_name(s.cwd.name, short), s.cwd, cmd, f"{s.session_id}")
+        return f"restarted in the same tmux pane: tmux -S {sock} attach -t {name}"
+    short = short_id(s.session_id) if s.session_id else s.conversation[:8]
+    return launch_detached(cfg, reconnect_name(s.cwd.name, short), s.cwd, cmd, s.key)
+
+
+# --------------------------------------------------------------------------- new-session
+
+NEW_SESSION_PREFIX = "sess-"   # must not start with session_prefix (the daemon would stop it)
+REGISTER_TIMEOUT = 45.0        # seconds to wait for the new session to connect to claude.ai
+
+
+def git_has_commit(path: Path) -> bool:
+    return subprocess.run(["git", "-C", str(path), "rev-parse", "--verify", "-q", "HEAD"],
+                          capture_output=True).returncode == 0
+
+
+def wait_for_session(pane_pid: int, timeout: float) -> LiveSession | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for s in live_sessions():
+            if pane_pid in (s.pid, s.parent_pid):
+                return s
+        if proc_start(pane_pid) is None:
+            return None
+        time.sleep(1)
+    return None
+
+
+@dataclass
+class NewSession:
+    name: str
+    url: str
+    folder: str
+    tmux: str
+    message: str
+
+
+def new_session(cfg: dict, project: Path, prompt: str | None = None, name: str | None = None,
+                here: bool = False) -> NewSession:
+    """Start a Remote Control session in `project` (in a new worktree unless `here`) and wait
+    until it connects to claude.ai."""
+    project = project.resolve()
+    if not project.is_dir():
+        raise CrpmError(f"no project folder {project}")
+    stamp = time.strftime("%m%d-%H%M%S")
+    name = name or f"{project.name}-{stamp}"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or stamp
+
+    argv = [cfg["claude_bin"]]
+    use_worktree = (project / ".git").exists() and not here
+    if use_worktree:
+        if not git_has_commit(project):
+            raise CrpmError(f"{project.name} has no commits yet, and a worktree is made from one. "
+                            "Commit first, or work in the project folder (--here).")
+        if (project / ".claude" / "worktrees" / slug).exists():
+            raise CrpmError(f"worktree {slug} already exists; pick another name")
+        argv.append(f"--worktree={slug}")
+    if cfg["permission_mode"]:
+        argv += ["--permission-mode", cfg["permission_mode"]]
+    argv.append(f"--remote-control={name}")
+    if prompt:
+        argv += ["--", prompt]
+    cmd = shlex.join(argv)
+
+    tname = session_name(NEW_SESSION_PREFIX, f"{project.name}-{slug}")
+    t = Tmux(cfg["tmux_socket"])
+    if t.has(tname):
+        raise CrpmError(f"tmux session {tname} already exists; pick another name")
+    started = launch_detached(cfg, tname, project, cmd,
+                              f"{name} ({'worktree ' + slug if use_worktree else 'in ' + str(project)})")
+    pane_pid = int(t.run("display-message", "-p", "-t", tname, "#{pane_pid}").stdout.strip() or 0)
+    s = wait_for_session(pane_pid, REGISTER_TIMEOUT)
+    if s:
+        url = f"https://claude.ai/code/{s.session_id}"
+        return NewSession(name, url, str(s.cwd), tname, f"{started}\n  connected: {url}\n  folder: {s.cwd}")
+    if t.has(tname) and not t.is_dead(tname):
+        raise CrpmError(f"{started}\n  not connected to claude.ai after {REGISTER_TIMEOUT:.0f}s; it may be "
+                        f"waiting on a prompt. Attach to check: tmux -L {cfg['tmux_socket']} attach -t {tname}")
+    raise CrpmError(f"claude exited. To see why, run in {project}:\n  {cmd}")
+
+
+# --------------------------------------------------------------------------- CLI
+
+def cmd_status(cfg: dict, _a) -> int:
+    have = servers(cfg)
+    if not have:
+        print("no managed sessions running")
+    for s in have:
+        print(f"{s.tmux:40} {s.state:26} {s.capacity:8} {s.mode:9} {s.path}")
+    return 0
+
+
+def cmd_attach(cfg: dict, a) -> int:
+    os.execvp("tmux", ["tmux", "-L", cfg["tmux_socket"], "attach", "-t", resolve(cfg, a.project)])
+
+
+def cmd_restart(cfg: dict, a) -> int:
+    print(restart_project(cfg, a.project))
+    return 0
+
+
+def cmd_reconnect(cfg: dict, a) -> int:
+    if a.session_id:
+        worktree, session_id = find_bridge_worktree(cfg, a.session_id), f"session_{short_id(a.session_id)}"
+    else:
+        found = bridge_worktree(Path.cwd())
+        if not found:
+            raise CrpmError("pass a session ID, or run this from inside a session worktree "
+                            "(.claude/worktrees/bridge-cse_*)")
+        worktree, session_id = found
+    print(reconnect_session(cfg, worktree, session_id))
+    return 0
 
 
 def cmd_restart_session(cfg: dict, a) -> int:
     sessions = live_sessions()
     if a.ids:
-        wanted = {i.removeprefix("session_").removeprefix("cse_") for i in a.ids}
-        chosen = [s for s in sessions if s.session_id.removeprefix("session_") in wanted]
-        missing = wanted - {s.session_id.removeprefix("session_") for s in chosen}
+        wanted = {short_id(i) for i in a.ids}
+        chosen = [s for s in sessions if short_id(s.session_id) in wanted]
+        missing = wanted - {short_id(s.session_id) for s in chosen}
         for m in sorted(missing):
             print(f"crpm restart-session: no running session session_{m} on this machine", file=sys.stderr)
         if missing and not chosen:
@@ -711,9 +947,8 @@ def cmd_restart_session(cfg: dict, a) -> int:
         here = Path.cwd()
         chosen = [s for s in sessions if s.cwd == here or s.cwd in here.parents]
     if not chosen:
-        print("crpm restart-session: no running Remote Control sessions match "
-              "(pass a session ID, --project NAME, or run it from a session's folder)", file=sys.stderr)
-        return 1
+        raise CrpmError("no running Remote Control sessions match "
+                        "(pass a session ID, --project NAME, or run it from a session's folder)")
     if len(chosen) > 1 and not (a.ids or a.project or a.all):
         print("Several sessions run in this folder; pass their IDs or --all:")
         for s in chosen:
@@ -741,14 +976,12 @@ def cmd_restart_session(cfg: dict, a) -> int:
                   f"(log: {log_path})")
             continue
         print(f"restarting {label}")
-        rc |= restart_session(cfg, s)
+        try:
+            print("  " + restart_session(cfg, s))
+        except CrpmError as e:
+            print(f"  {e}", file=sys.stderr)
+            rc = 1
     return rc
-
-
-# --------------------------------------------------------------------------- new-session
-
-NEW_SESSION_PREFIX = "sess-"   # must not start with session_prefix (the daemon would stop it)
-REGISTER_TIMEOUT = 45.0        # seconds to wait for the new session to connect to claude.ai
 
 
 def project_from_cwd(cfg: dict) -> Path | None:
@@ -756,23 +989,6 @@ def project_from_cwd(cfg: dict) -> Path | None:
     if here == root or root not in here.parents:
         return None
     return root / here.relative_to(root).parts[0]
-
-
-def git_has_commit(path: Path) -> bool:
-    return subprocess.run(["git", "-C", str(path), "rev-parse", "--verify", "-q", "HEAD"],
-                          capture_output=True).returncode == 0
-
-
-def wait_for_session(pane_pid: int, timeout: float) -> LiveSession | None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for s in live_sessions():
-            if pane_pid in (s.pid, s.parent_pid):
-                return s
-        if proc_start(pane_pid) is None:
-            return None
-        time.sleep(1)
-    return None
 
 
 def cmd_new_session(cfg: dict, a) -> int:
@@ -784,52 +1000,9 @@ def cmd_new_session(cfg: dict, a) -> int:
     else:
         project = project_from_cwd(cfg)
         if project is None:
-            print("crpm new-session: name a project, or run this from inside one", file=sys.stderr)
-            return 1
-    project = project.resolve()
-    if not project.is_dir():
-        print(f"crpm new-session: no project folder {project}", file=sys.stderr)
-        return 1
-    stamp = time.strftime("%m%d-%H%M%S")
-    name = a.name or f"{project.name}-{stamp}"
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or stamp
-
-    argv = [cfg["claude_bin"]]
-    use_worktree = (project / ".git").exists() and not a.here
-    if use_worktree:
-        if not git_has_commit(project):
-            print(f"crpm new-session: {project.name} has no commits yet, and a worktree is made from one. "
-                  "Commit first, or pass --here to work in the project folder.", file=sys.stderr)
-            return 1
-        if (project / ".claude" / "worktrees" / slug).exists():
-            print(f"crpm new-session: worktree {slug} already exists; pick another --name", file=sys.stderr)
-            return 1
-        argv.append(f"--worktree={slug}")
-    if cfg["permission_mode"]:
-        argv += ["--permission-mode", cfg["permission_mode"]]
-    argv.append(f"--remote-control={name}")
-    if a.prompt:
-        argv += ["--", a.prompt]
-    cmd = shlex.join(argv)
-
-    tname = session_name(NEW_SESSION_PREFIX, f"{project.name}-{slug}")
-    t = Tmux(cfg["tmux_socket"])
-    if t.has(tname):
-        print(f"crpm new-session: tmux session {tname} already exists; pick another --name", file=sys.stderr)
-        return 1
-    if launch_detached(cfg, tname, project, cmd, f"{name} ({'worktree ' + slug if use_worktree else 'in ' + str(project)})"):
-        return 1
-    pane_pid = int(t.run("display-message", "-p", "-t", tname, "#{pane_pid}").stdout.strip() or 0)
-    s = wait_for_session(pane_pid, REGISTER_TIMEOUT)
-    if s:
-        print(f"  connected: https://claude.ai/code/{s.session_id}\n  folder: {s.cwd}")
-        return 0
-    if t.has(tname) and not t.is_dead(tname):
-        print(f"  not connected to claude.ai after {REGISTER_TIMEOUT:.0f}s; it may be waiting on a prompt. "
-              f"Attach to check: tmux -L {cfg['tmux_socket']} attach -t {tname}", file=sys.stderr)
-    else:
-        print(f"  claude exited. To see why, run in {project}:\n  {cmd}", file=sys.stderr)
-    return 1
+            raise CrpmError("name a project, or run this from inside one")
+    print(new_session(cfg, project, a.prompt, a.name, a.here).message)
+    return 0
 
 
 def cmd_stop_all(cfg: dict, _a) -> int:
@@ -847,7 +1020,9 @@ def main(argv=None) -> int:
     sub.add_parser("daemon")
     sub.add_parser("status")
     sub.add_parser("stop-all")
-    sub.add_parser("reconnect")
+    rc = sub.add_parser("reconnect", help="serve a spawned session again after its server stopped")
+    rc.add_argument("session_id", nargs="?", metavar="SESSION_ID",
+                    help="session_..., cse_..., or the bare ID (default: the session worktree you're in)")
     rs = sub.add_parser("restart-session", help="restart idle sessions so they load new config")
     rs.add_argument("ids", nargs="*", metavar="SESSION_ID",
                     help="session_..., cse_..., or the bare ID (default: sessions in the current folder)")
@@ -873,10 +1048,13 @@ def main(argv=None) -> int:
     if a.cmd == "daemon":
         Manager(cfg).run()
         return 0
-    return {"status": cmd_status, "attach": cmd_attach, "restart": cmd_restart,
-            "reconnect": cmd_reconnect, "restart-session": cmd_restart_session,
-            "new-session": cmd_new_session,
-            "stop-all": cmd_stop_all}[a.cmd](cfg, a)
+    try:
+        return {"status": cmd_status, "attach": cmd_attach, "restart": cmd_restart,
+                "reconnect": cmd_reconnect, "restart-session": cmd_restart_session,
+                "new-session": cmd_new_session, "stop-all": cmd_stop_all}[a.cmd](cfg, a)
+    except CrpmError as e:
+        print(f"crpm {a.cmd}: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
