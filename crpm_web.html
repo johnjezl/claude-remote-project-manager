@@ -106,6 +106,12 @@ details[open] > summary .chev { transform: rotate(90deg); }
 .sinfo { flex: 1; min-width: 0; }
 .sname { font-weight: 550; overflow-wrap: anywhere; }
 .ssub { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.sid { display: flex; align-items: center; gap: 6px; margin-top: 3px; min-width: 0; }
+.sid code { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; min-width: 0; user-select: all; }
+button.copy { font-size: 11.5px; font-weight: 500; padding: 1px 7px; min-height: 22px; border-radius: 6px; color: var(--muted); flex: none; }
+.subrow { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.subrow button.copy { margin-top: 14px; }
 .sact { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .subhead { font-size: 12px; color: var(--muted); font-weight: 600; margin: 14px 0 0; text-transform: uppercase; letter-spacing: .04em; }
 .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
@@ -233,6 +239,21 @@ function toast(msg, err) {
   setTimeout(() => t.remove(), err ? 12000 : 6000);
 }
 
+async function copyText(text, what) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+    else {
+      const ta = h("textarea", { style: "position:fixed;opacity:0;top:0;left:0" });
+      ta.value = text; document.body.append(ta); ta.select();
+      const ok = document.execCommand("copy"); ta.remove();
+      if (!ok) throw new Error("copy blocked");
+    }
+    toast("Copied " + what);
+  } catch { toast("Couldn't copy; long-press the ID to select it", true); }
+}
+const copyBtn = (text, what, label = "Copy") => h("button", { class: "copy", type: "button", title: "Copy " + what,
+  onclick: (e) => { e.preventDefault(); e.stopPropagation(); copyText(text, what); }, text: label });
+
 async function api(method, path, body) {
   const r = await fetch(path, {
     method, headers: { "Authorization": "Bearer " + token, ...(body ? { "Content-Type": "application/json" } : {}) },
@@ -335,7 +356,11 @@ function sessionRow(s, project) {
     h("span", { class: "dot " + (s.remote ? s.status : "local"), title: s.remote ? s.status : "local only" }),
     h("div", { class: "sinfo" },
       h("div", { class: "sname", text: label }),
-      h("div", { class: "ssub", text: sub })),
+      h("div", { class: "ssub", text: sub }),
+      s.session_id
+        ? h("div", { class: "sid" }, h("code", { text: s.session_id, title: "session ID" }), copyBtn(s.session_id, s.session_id))
+        : h("div", { class: "sid" }, h("code", { text: "conversation " + s.conversation, title: "local conversation ID (claude --resume)" }),
+            copyBtn(s.conversation, "conversation ID"))),
     h("div", { class: "sact" },
       s.url ? h("a", { class: "btn small", href: s.url, target: "_blank", rel: "noopener noreferrer", text: "Open" }) : null,
       btn("s:" + s.key, s.remote ? "Restart" : "Connect", restart, "small")));
@@ -373,7 +398,9 @@ function projectCard(p) {
     s ? btn("v:" + p.name, "Screen", () => showScreen(p.name), "small") : null,
     s ? btn("r:" + p.name, "Restart server", () => restartServer(p), "small danger") : null));
 
-  body.append(h("div", { class: "subhead", text: "Sessions" }));
+  const ids = p.sessions.map((x) => x.session_id).filter(Boolean);
+  body.append(h("div", { class: "subrow" }, h("div", { class: "subhead", text: "Sessions" }),
+    ids.length > 1 ? copyBtn(ids.join("\n"), `${ids.length} session IDs`, "Copy all IDs") : null));
   if (p.sessions.length) body.append(h("div", {}, p.sessions.map((x) => sessionRow(x, p))));
   else body.append(h("div", { class: "empty", text: "No sessions running." }));
 

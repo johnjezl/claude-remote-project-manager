@@ -14,6 +14,7 @@ Subcommands:
   restart PROJECT   restart one project's remote-control server
   reconnect         from a session's worktree, bring that session back in tmux
   restart-session   restart idle sessions so they load new settings, MCP servers, etc.
+  sessions [PROJECT] list running sessions and their session IDs
   new-session       start a new Remote Control session in a project (in its own worktree)
   stop-all          shut down every managed remote-control server
   web               serve the web dashboard (what crpm-web.service runs)
@@ -832,6 +833,35 @@ def restart_session(cfg: dict, s: LiveSession) -> str:
     return launch_detached(cfg, reconnect_name(s.cwd.name, short), s.cwd, cmd, s.key)
 
 
+def session_project(cfg: dict, s: LiveSession) -> str | None:
+    """The projects_dir folder a session runs in (its worktree is inside it), if any."""
+    root = cfg["projects_dir"]
+    return s.cwd.relative_to(root).parts[0] if root in s.cwd.parents else None
+
+
+def session_info(cfg: dict, s: LiveSession) -> dict:
+    """A session as plain data, for `crpm sessions --json` and the web dashboard."""
+    project = session_project(cfg, s)
+    rel = Path(*s.cwd.relative_to(cfg["projects_dir"]).parts[1:]) if project else s.cwd  # within its project
+    wt = bridge_worktree(s.cwd)
+    parts = s.cwd.parts
+    worktree = wt[0].name if wt else (parts[parts.index("worktrees") + 1]
+                                      if ".claude" in parts and "worktrees" in parts[:-1] else "")
+    return {"key": s.key, "session_id": s.session_id, "conversation": s.conversation,
+            "remote": bool(s.session_id),
+            "url": f"https://claude.ai/code/{s.session_id}" if s.session_id else "",
+            "name": s.name, "kind": s.kind, "status": s.status, "pid": s.pid, "project": project,
+            "folder": str(rel), "worktree": worktree, "tmux": s.tmux}
+
+
+def project_sessions(cfg: dict, project: str | None = None, include_local: bool = True) -> list[dict]:
+    """Running sessions (session_info), optionally only one project's, sorted by project and name."""
+    out = [session_info(cfg, s) for s in live_sessions(include_local=include_local)]
+    if project is not None:
+        out = [i for i in out if i["project"] == project]
+    return sorted(out, key=lambda i: ((i["project"] or "~").lower(), i["name"].lower(), i["key"]))
+
+
 # --------------------------------------------------------------------------- new-session
 
 NEW_SESSION_PREFIX = "sess-"   # must not start with session_prefix (the daemon would stop it)
@@ -1002,6 +1032,43 @@ def project_from_cwd(cfg: dict) -> Path | None:
     return root / here.relative_to(root).parts[0]
 
 
+def cmd_sessions(cfg: dict, a) -> int:
+    if a.project:
+        project = a.project.rstrip("/").rsplit("/", 1)[-1]
+        if not (cfg["projects_dir"] / project).is_dir():
+            raise CrpmError(f"no project folder {cfg['projects_dir'] / project}")
+    else:
+        here = project_from_cwd(cfg)
+        project = here.name if here else None  # outside any project: list them all
+    found = project_sessions(cfg, project, include_local=not a.remote)
+    if a.json:
+        print(json.dumps(found, indent=2))
+        return 0
+    if a.ids:
+        print("\n".join(i["session_id"] for i in found if i["session_id"]))
+        return 0
+    if not found:
+        print(f"no running sessions{' in ' + project if project else ''}")
+        return 0
+    def clip(text: str, n: int) -> str:
+        return text if len(text) <= n else text[:n - 1] + "…"
+    row = "  {:36} {:6} {:10} {:30} {}"
+    print(row.format("SESSION ID", "STATUS", "KIND", "NAME", "WHERE"))
+    last = object()
+    for i in found:
+        if i["project"] != last:
+            last = i["project"]
+            print(last or "(outside projects_dir)")
+        where = f"worktree {i['worktree']}" if i["worktree"] else \
+            (i["folder"] if i["folder"] != "." else "project folder")
+        sid = i["session_id"] or i["conversation"]
+        print(row.format(sid, i["status"] if i["remote"] else "local", i["kind"], clip(i["name"] or "-", 30), where))
+    if any(not i["remote"] for i in found):
+        print("\nlocal: running here but not on Remote Control, so the app can't reach it.\n"
+              "  The ID is its conversation (claude --resume <id>). The dashboard's Connect button puts it back on.")
+    return 0
+
+
 def cmd_new_session(cfg: dict, a) -> int:
     if a.project and not a.prompt and "/" not in a.project and project_from_cwd(cfg) \
             and not (cfg["projects_dir"] / a.project).is_dir():
@@ -1095,21 +1162,7 @@ def web_project(cfg: dict, name: str) -> str:
     raise CrpmError(f"no project {name!r}")
 
 
-def session_json(cfg: dict, s: LiveSession) -> dict:
-    root = cfg["projects_dir"]
-    rel = Path(*s.cwd.relative_to(root).parts[1:]) if root in s.cwd.parents else s.cwd  # within its project
-    wt = bridge_worktree(s.cwd)
-    parts = s.cwd.parts
-    worktree = wt[0].name if wt else (parts[parts.index("worktrees") + 1]
-                                      if ".claude" in parts and "worktrees" in parts[:-1] else "")
-    return {"key": s.key, "session_id": s.session_id, "remote": bool(s.session_id),
-            "url": f"https://claude.ai/code/{s.session_id}" if s.session_id else "",
-            "name": s.name, "kind": s.kind, "status": s.status, "pid": s.pid,
-            "folder": str(rel), "worktree": worktree, "tmux": s.tmux}
-
-
 def api_status(cfg: dict, user: User, _body: dict) -> dict:
-    root = cfg["projects_dir"]
     by_name = {s.project: s for s in servers(cfg)}
     projects: dict[str, dict] = {}
     for p in project_dirs(cfg):
@@ -1123,14 +1176,18 @@ def api_status(cfg: dict, user: User, _body: dict) -> dict:
         p["has_commit"] = p["git"] and ((p["server"] or {}).get("mode") == "worktree"
                                         or git_has_commit(Path(p["path"])))
     other = []
-    for s in live_sessions(include_local=True):
-        top = s.cwd.relative_to(root).parts[0] if root in s.cwd.parents else None
-        (projects[top]["sessions"] if top in projects else other).append(session_json(cfg, s))
+    for i in project_sessions(cfg):
+        (projects[i["project"]]["sessions"] if i["project"] in projects else other).append(i)
     for r in reconnect_candidates(cfg):
         if r.project in projects and time.time() - r.last_active < RECONNECT_SHOW:
             projects[r.project]["reconnectable"].append(asdict(r))
     return {"user": user.name, "host": socket.gethostname(), "time": time.time(),
             "projects": list(projects.values()), "other_sessions": other}
+
+
+def api_sessions(cfg: dict, _user: User, _body: dict, project: str) -> dict:
+    name = web_project(cfg, project)
+    return {"project": name, "sessions": project_sessions(cfg, name)}
 
 
 def api_screen(cfg: dict, _user: User, _body: dict, project: str) -> dict:
@@ -1170,6 +1227,7 @@ def api_reconnect(cfg: dict, _user: User, _body: dict, session_id: str) -> dict:
 
 WEB_ROUTES = [
     ("GET", r"/api/status", api_status),
+    ("GET", r"/api/projects/([^/]+)/sessions", api_sessions),
     ("GET", r"/api/projects/([^/]+)/screen", api_screen),
     ("POST", r"/api/projects/([^/]+)/restart", api_restart_project),
     ("POST", r"/api/projects/([^/]+)/trust", api_trust),
@@ -1317,6 +1375,11 @@ def main(argv=None) -> int:
     rs.add_argument("--force", action="store_true", help="also restart sessions that are not idle")
     rs.add_argument("--dry-run", action="store_true", help="only show what would be restarted")
     rs.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
+    ss = sub.add_parser("sessions", help="list running sessions and their session IDs")
+    ss.add_argument("project", nargs="?", help="project folder name (default: the project you're in, else all)")
+    ss.add_argument("--ids", action="store_true", help="print only session IDs, one per line")
+    ss.add_argument("--json", action="store_true", help="print full details as JSON")
+    ss.add_argument("--remote", action="store_true", help="only sessions on Remote Control")
     ns = sub.add_parser("new-session", help="start a new Remote Control session in a project")
     ns.add_argument("project", nargs="?", help="project folder name or path (default: the project you're in)")
     ns.add_argument("prompt", nargs="?", help="first message for the session")
@@ -1342,7 +1405,7 @@ def main(argv=None) -> int:
     try:
         return {"status": cmd_status, "attach": cmd_attach, "restart": cmd_restart,
                 "reconnect": cmd_reconnect, "restart-session": cmd_restart_session,
-                "new-session": cmd_new_session, "stop-all": cmd_stop_all,
+                "sessions": cmd_sessions, "new-session": cmd_new_session, "stop-all": cmd_stop_all,
                 "web": cmd_web, "web-token": cmd_web_token}[a.cmd](cfg, a)
     except CrpmError as e:
         print(f"crpm {a.cmd}: {e}", file=sys.stderr)

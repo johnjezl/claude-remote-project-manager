@@ -48,6 +48,8 @@ To have crpm start at boot without logging in, enable linger: `sudo loginctl ena
 crpm status                     # project, state, sessions in use/capacity, spawn mode, path
 crpm attach sd-mux              # watch or answer a project's remote-control TUI (detach: Ctrl-b d)
 crpm restart sd-mux             # bounce one project
+crpm sessions [PROJECT]         # running sessions and their session IDs (default: the project you're in,
+                                #   else all; --ids for IDs only, --json for details, --remote for RC only)
 crpm reconnect [SESSION_ID]     # bring a session back in tmux after its server stopped
                                 #   (no ID: the session whose worktree you're in)
 crpm new-session PROJECT ["first message"] [-n NAME] [--here]
@@ -65,7 +67,8 @@ crpm web-token [USER]           # create/replace a web dashboard login (--revoke
 `crpm-web.service` serves a dashboard at <http://localhost:8765> that does what the CLI does,
 from any browser, including your phone:
 
-* every project with its server state, and the sessions running in it (open them in claude.ai)
+* every project with its server state, and the sessions running in it with their session IDs
+  (copy one, or all of a project's; open them in claude.ai)
 * **New session**: pick a project, type the first message, get the claude.ai link
 * **Trust** a project waiting on its first-run trust prompt, without `crpm attach`
 * restart a project's server, restart a session (or put a local session on Remote Control),
