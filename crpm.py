@@ -12,7 +12,7 @@ Subcommands:
   status            list managed projects and their state
   attach PROJECT    attach your terminal to a project's tmux session
   restart PROJECT   restart one project's remote-control server
-  reconnect         from a session's worktree, bring that session back in tmux
+  reconnect         bring stopped sessions back (--all: everything the last reboot interrupted)
   restart-session   restart idle sessions so they load new settings, MCP servers, etc.
   sessions [PROJECT] list running sessions and their session IDs
   new-session       start a new Remote Control session in a project (in its own worktree)
@@ -207,6 +207,8 @@ class Manager:
     trust_hinted: set[str] = field(default_factory=set)
     committed: set[Path] = field(default_factory=set)     # git repos known to have a commit
     deferred: dict[str, str] = field(default_factory=dict)  # name -> command it will restart with
+    registry: dict = field(default_factory=dict)          # the session registry (load_registry)
+    registry_saved: float = 0.0
     stopping: bool = False
 
     def __post_init__(self):
@@ -416,6 +418,17 @@ class Manager:
                     bo.failures = 0  # stable again
 
         self.handle_trust_prompts(self.tmux.sessions(self.cfg["session_prefix"]))
+        self.track_sessions()
+
+    def track_sessions(self) -> None:
+        """Keep the session registry current, so `crpm reconnect --all` knows what a reboot interrupted."""
+        try:
+            changed = track_sessions(self.cfg, self.registry, live_sessions())
+            if changed or time.time() - self.registry_saved >= REGISTRY_HEARTBEAT:
+                save_registry(self.cfg, self.registry)
+                self.registry_saved = time.time()
+        except OSError as e:
+            log.warning("could not update the session registry: %s", e)
 
     def run(self) -> None:
         def on_term(signum, _frame):
@@ -424,6 +437,13 @@ class Manager:
         signal.signal(signal.SIGTERM, on_term)
         signal.signal(signal.SIGINT, on_term)
         log.info("watching %s (tmux socket '%s')", self.cfg["projects_dir"], self.cfg["tmux_socket"])
+        self.registry = load_registry(self.cfg)
+        boot = boot_id()
+        cut = [e for e in self.registry["sessions"].values() if interrupted(self.registry, e, boot)
+               and e.get("boot") != boot]
+        if cut and boot not in self.registry["boots"]:
+            log.info("%d session(s) were running when the machine restarted; bring them back with "
+                     "`crpm reconnect --all` (or Reconnect all in the dashboard)", len(cut))
         while not self.stopping:
             try:
                 self.reconcile()
@@ -605,9 +625,9 @@ def find_bridge_worktree(cfg: dict, session_id: str) -> Path:
     return hits[0]
 
 
-def reconnect_session(cfg: dict, worktree: Path, session_id: str) -> str:
+def reconnect_session(cfg: dict, worktree: Path, session_id: str, project: str | None = None) -> str:
     """Serve a spawned session again, from its worktree, after its project's server stopped."""
-    name = reconnect_name(worktree.parents[2].name, session_id)
+    name = reconnect_name(project or worktree.parents[2].name, session_id)
     t = Tmux(cfg["tmux_socket"])
     if not (t.has(name) and not t.is_dead(name)):
         pid = serving_pid(session_id)
@@ -631,27 +651,53 @@ def transcript_mtime(cwd: Path) -> float | None:
     return max(times, default=None)
 
 
+def latest_transcript(cwd: Path) -> str | None:
+    """Conversation ID of the transcript Claude last wrote for a session run in `cwd`."""
+    d = claude_config_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    files = [(f.stat().st_mtime, f.stem) for f in d.glob("*.jsonl")]
+    return max(files)[1] if files else None
+
+
 @dataclass
 class Reconnectable:
     project: str
     session_id: str
-    worktree: str
+    worktree: str        # the folder it runs in (a worktree, or the project folder)
     last_active: float
+    kind: str = "spawned"
+    name: str = ""
+    interrupted: bool = False   # was running when the machine last restarted
 
 
 def reconnect_candidates(cfg: dict) -> list[Reconnectable]:
-    """Spawned-session worktrees that nothing serves and whose server no longer knows them.
+    """Sessions that nothing serves now and that a reconnect could bring back, interrupted ones first.
 
-    A project's server serves its own spawned sessions again on their next message, so only
-    worktrees made before that server started (i.e. by an earlier server) need a reconnect."""
+    From the session registry: every session that was running at the last reboot, and spawned or
+    reattached sessions that stopped recently. Plus spawned-session worktrees from before the
+    registry, whose server no longer knows them. (A project's server serves its own spawned
+    sessions again on their next message, so only ones made by an earlier server need a reconnect.)"""
     served = served_session_ids()
     started = {Path(i["path"]).name: int(i["created"] or 0)
                for i in Tmux(cfg["tmux_socket"]).sessions(cfg["session_prefix"]).values()
                if not i["dead"] and i["path"]}
-    out = []
+    reg, boot, now = load_registry(cfg), boot_id(), time.time()
+    out: dict[str, Reconnectable] = {}
+    for sid, e in reg["sessions"].items():
+        if sid in served or not Path(e["cwd"]).is_dir():
+            continue
+        cut = interrupted(reg, e, boot)
+        ended = e.get("ended_at") or e["last_seen"]
+        if not cut:
+            if e["kind"] == "terminal" or now - ended > RECONNECT_SHOW:
+                continue  # closed on purpose, or long gone
+            if e["kind"] == "spawned" and e.get("boot") == boot and \
+                    started.get(e.get("project"), float("inf")) <= e.get("first_seen", 0):
+                continue  # its server still knows it
+        out[sid] = Reconnectable(e.get("project") or Path(e["cwd"]).name, sid, e["cwd"], ended,
+                                 e["kind"], e.get("name") or "", cut)
     for wt in cfg["projects_dir"].glob("*/.claude/worktrees/bridge-cse_*"):
         found = bridge_worktree(wt)
-        if not found or found[1] in served:
+        if not found or found[1] in served or found[1] in out or found[1] in reg["sessions"]:
             continue
         project = wt.parents[2].name
         try:
@@ -660,8 +706,10 @@ def reconnect_candidates(cfg: dict) -> list[Reconnectable]:
             continue  # not (or no longer) a worktree
         if started.get(project, float("inf")) <= made:
             continue
-        out.append(Reconnectable(project, found[1], str(wt), transcript_mtime(wt) or made))
-    return sorted(out, key=lambda r: -r.last_active)
+        last = transcript_mtime(wt) or made
+        if now - last < RECONNECT_SHOW:
+            out[found[1]] = Reconnectable(project, found[1], str(wt), last)
+    return sorted(out.values(), key=lambda r: (not r.interrupted, -r.last_active))
 
 
 # --------------------------------------------------------------------------- live sessions
@@ -938,6 +986,173 @@ def new_session(cfg: dict, project: Path, prompt: str | None = None, name: str |
     raise CrpmError(f"claude exited. To see why, run in {project}:\n  {cmd}")
 
 
+# --------------------------------------------------------------------------- session registry
+# Claude Code deletes its per-process session records, so after a reboot nothing says which sessions
+# were running. The daemon keeps its own list in log_dir/sessions.json: every Remote Control session
+# it sees, tagged with the kernel boot it was seen in, and when it ended if it ended while the machine
+# stayed up. A session still running at the end of the previous boot was interrupted by the restart.
+
+REGISTRY_KEEP = 14 * 24 * 3600  # forget sessions not seen for this long
+REGISTRY_HEARTBEAT = 15.0       # seconds between registry writes when nothing changes
+SHUTDOWN_GRACE = 60.0           # sessions that ended this close to a boot's last heartbeat died with it
+RESUME_FLAGS = ("--permission-mode", "--model")  # flags of an interactive session that a resume keeps
+
+
+def boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def registry_path(cfg: dict) -> Path:
+    return Path(cfg["log_dir"]).expanduser() / "sessions.json"
+
+
+def load_registry(cfg: dict) -> dict:
+    """{"sessions": {session_id: entry}, "boots": {boot_id: last heartbeat}}"""
+    try:
+        d = json.loads(registry_path(cfg).read_text())
+        if isinstance(d.get("sessions"), dict) and isinstance(d.get("boots"), dict):
+            return d
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {"sessions": {}, "boots": {}}
+
+
+def save_registry(cfg: dict, reg: dict) -> None:
+    path = registry_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(reg, indent=1))
+    tmp.replace(path)
+
+
+def launch_flags(argv: list[str]) -> dict[str, str]:
+    """The flags an interactive claude was started with that resuming it should keep."""
+    out = {}
+    for i, arg in enumerate(argv):
+        if arg == "--":
+            break  # the rest is the first message
+        flag, eq, val = arg.partition("=")
+        if flag in RESUME_FLAGS:
+            if eq:
+                out[flag] = val
+            elif i + 1 < len(argv):
+                out[flag] = argv[i + 1]
+        elif flag in ("--remote-control", "--rc") and eq:
+            out["--remote-control"] = val
+    return out
+
+
+def track_sessions(cfg: dict, reg: dict, live: list[LiveSession]) -> bool:
+    """Update the registry from the sessions running now. True if anything but timestamps changed."""
+    now, boot = time.time(), boot_id()
+    sessions: dict[str, dict] = reg["sessions"]
+    before = {k: (e.get("conversation"), e.get("boot"), e.get("ended_at") is None) for k, e in sessions.items()}
+    seen = set()
+    for s in live:
+        if not s.session_id:
+            continue
+        seen.add(s.session_id)
+        e = sessions.setdefault(s.session_id, {"session_id": s.session_id, "first_seen": now})
+        if e.get("boot") != boot:
+            e["first_seen"] = now  # running again after a reboot: a new run as far as its server goes
+        e.update(conversation=s.conversation, cwd=str(s.cwd), name=s.name, kind=s.kind,
+                 project=session_project(cfg, s) or "", tmux=s.tmux, boot=boot, last_seen=now, ended_at=None)
+        if s.kind == "terminal":
+            e["flags"] = launch_flags(proc_argv(s.pid))
+    for sid, e in sessions.items():
+        if sid not in seen and e.get("boot") == boot and e.get("ended_at") is None:
+            e["ended_at"] = now
+    for sid in [k for k, e in sessions.items() if now - e.get("last_seen", 0) > REGISTRY_KEEP]:
+        del sessions[sid]
+    reg["boots"][boot] = now
+    used = {e.get("boot") for e in sessions.values()} | {boot}
+    reg["boots"] = {b: t for b, t in reg["boots"].items() if b in used}
+    return before != {k: (e.get("conversation"), e.get("boot"), e.get("ended_at") is None)
+                      for k, e in sessions.items()}
+
+
+def previous_boot(reg: dict, boot: str) -> str | None:
+    earlier = [(t, b) for b, t in reg["boots"].items() if b != boot]
+    return max(earlier)[1] if earlier else None
+
+
+def interrupted(reg: dict, e: dict, boot: str) -> bool:
+    """Was this session running when the machine last restarted?"""
+    prev = previous_boot(reg, boot)
+    if not prev or e.get("boot") != prev:
+        return False
+    return e.get("ended_at") is None or e["ended_at"] >= reg["boots"][prev] - SHUTDOWN_GRACE
+
+
+def resume_terminal(cfg: dict, e: dict) -> str:
+    """Resume an interactive session's conversation, Remote Control on, in a detached tmux session."""
+    sid, cwd = e["session_id"], Path(e["cwd"])
+    conv = e.get("conversation")
+    transcripts = claude_config_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    if not conv or not (transcripts / f"{conv}.jsonl").exists():
+        conv = latest_transcript(cwd)
+    if not conv:
+        raise CrpmError(f"no transcript for {sid} in {transcripts}, so there is nothing to resume")
+    flags = e.get("flags") or {}
+    argv = [cfg["claude_bin"], "--resume", conv]
+    for f in RESUME_FLAGS:
+        if f in flags:
+            argv += [f, flags[f]]
+    argv.append(f"--remote-control={flags.get('--remote-control') or e.get('name') or cwd.name}")
+    tmux = e.get("tmux") or ""
+    if not tmux.startswith(NEW_SESSION_PREFIX):  # only reuse names crpm gave it, on crpm's tmux server
+        tmux = reconnect_name(e.get("project") or cwd.name, sid)
+    return launch_detached(cfg, tmux, cwd, shlex.join(argv), f"{e.get('name') or sid} ({sid})")
+
+
+def reconnect(cfg: dict, session_id: str) -> str:
+    """Bring a stopped session back on Remote Control, whatever kind it was."""
+    short = short_id(session_id)
+    if not re.fullmatch(r"[A-Za-z0-9]+", short):
+        raise CrpmError(f"not a session ID: {session_id}")
+    sid = f"session_{short}"
+    e = load_registry(cfg)["sessions"].get(sid)
+    if not e:
+        return reconnect_session(cfg, find_bridge_worktree(cfg, sid), sid)
+    cwd = Path(e["cwd"])
+    if not cwd.is_dir():
+        raise CrpmError(f"{sid} ran in {cwd}, which no longer exists")
+    pid = serving_pid(sid)
+    if pid:
+        raise CrpmError(f"{sid} is already running (PID {pid})")
+    if e["kind"] == "terminal":
+        return resume_terminal(cfg, e)
+    found = bridge_worktree(cwd)
+    return reconnect_session(cfg, found[0] if found else cwd, sid, e.get("project") or cwd.name)
+
+
+def reconnect_all(cfg: dict, todo: list[Reconnectable] | None = None) -> list[dict]:
+    """Reconnect every session the last restart interrupted, and wait for them to come back on."""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [r for r in reconnect_candidates(cfg) if r.interrupted] if todo is None else todo
+
+    def one(r: Reconnectable) -> dict:
+        out = {**asdict(r), "url": f"https://claude.ai/code/{r.session_id}", "connected": False}
+        try:
+            return {**out, "ok": True, "message": reconnect(cfg, r.session_id)}
+        except CrpmError as e:
+            return {**out, "ok": False, "message": str(e)}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(one, todo))
+    pending = {x["session_id"] for x in results if x["ok"]}
+    deadline = time.time() + REGISTER_TIMEOUT
+    while pending and time.time() < deadline:
+        pending -= {s.session_id for s in live_sessions()}
+        if pending:
+            time.sleep(1)
+    for x in results:
+        x["connected"] = x["ok"] and x["session_id"] not in pending
+    return results
+
+
 # --------------------------------------------------------------------------- CLI
 
 def cmd_status(cfg: dict, _a) -> int:
@@ -946,6 +1161,9 @@ def cmd_status(cfg: dict, _a) -> int:
         print("no managed sessions running")
     for s in have:
         print(f"{s.tmux:40} {s.state:26} {s.capacity:8} {s.mode:9} {s.path}")
+    cut = sum(r.interrupted for r in reconnect_candidates(cfg))
+    if cut:
+        print(f"\n{cut} session(s) were running when the machine restarted: crpm reconnect --all")
     return 0
 
 
@@ -959,16 +1177,57 @@ def cmd_restart(cfg: dict, a) -> int:
 
 
 def cmd_reconnect(cfg: dict, a) -> int:
+    if a.list or a.all:
+        found = reconnect_candidates(cfg)
+        todo = [r for r in found if r.interrupted] if a.all else found
+        if not todo:
+            print("no sessions were interrupted by the last restart" if a.all else "nothing to reconnect")
+            if a.all and found:
+                print(f"({len(found)} older stopped session(s): crpm reconnect --list)")
+            return 0
+        if a.list or a.dry_run:
+            row = "{:36} {:10} {:16} {:28} {}"
+            print(row.format("SESSION ID", "KIND", "STOPPED", "PROJECT", "NAME"))
+            for r in todo:
+                when = "at restart" if r.interrupted else ago(r.last_active)
+                print(row.format(r.session_id, r.kind, when, r.project[:28], r.name or Path(r.worktree).name))
+            if a.list and any(r.interrupted for r in todo):
+                print("\nbring back the ones stopped at restart: crpm reconnect --all")
+            return 0
+        print(f"reconnecting {len(todo)} session(s)…", flush=True)
+        failed = 0
+        for x in reconnect_all(cfg, todo):
+            label = f"{x['project']}: {x['name'] or Path(x['worktree']).name}"
+            if x["connected"]:
+                print(f"  ok      {label}\n          {x['url']}")
+            elif x["ok"]:
+                print(f"  started {label} (not on claude.ai yet; it may be waiting on a prompt)\n"
+                      f"          {x['message'].splitlines()[-1].strip()}")
+            else:
+                failed += 1
+                print(f"  FAILED  {label}: {x['message']}")
+        return 1 if failed else 0
     if a.session_id:
-        worktree, session_id = find_bridge_worktree(cfg, a.session_id), f"session_{short_id(a.session_id)}"
-    else:
-        found = bridge_worktree(Path.cwd())
-        if not found:
-            raise CrpmError("pass a session ID, or run this from inside a session worktree "
-                            "(.claude/worktrees/bridge-cse_*)")
-        worktree, session_id = found
-    print(reconnect_session(cfg, worktree, session_id))
-    return 0
+        print(reconnect(cfg, a.session_id))
+        return 0
+    found = bridge_worktree(Path.cwd())
+    if found:
+        print(reconnect(cfg, found[1]))
+        return 0
+    here = [r for r in reconnect_candidates(cfg) if Path(r.worktree) == Path.cwd().resolve()]
+    if len(here) == 1:
+        print(reconnect(cfg, here[0].session_id))
+        return 0
+    raise CrpmError("pass a session ID (see crpm reconnect --list), --all, or run this from the folder "
+                    "of the session to bring back" + (f" ({len(here)} stopped sessions ran here)" if here else ""))
+
+
+def ago(t: float) -> str:
+    d = max(0, time.time() - t)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if d >= n:
+            return f"{int(d // n)}{unit} ago"
+    return "just now"
 
 
 def cmd_restart_session(cfg: dict, a) -> int:
@@ -1178,11 +1437,13 @@ def api_status(cfg: dict, user: User, _body: dict) -> dict:
     other = []
     for i in project_sessions(cfg):
         (projects[i["project"]]["sessions"] if i["project"] in projects else other).append(i)
+    cut = 0
     for r in reconnect_candidates(cfg):
-        if r.project in projects and time.time() - r.last_active < RECONNECT_SHOW:
+        cut += r.interrupted
+        if r.project in projects and (r.interrupted or time.time() - r.last_active < RECONNECT_SHOW):
             projects[r.project]["reconnectable"].append(asdict(r))
     return {"user": user.name, "host": socket.gethostname(), "time": time.time(),
-            "projects": list(projects.values()), "other_sessions": other}
+            "projects": list(projects.values()), "other_sessions": other, "interrupted": cut}
 
 
 def api_sessions(cfg: dict, _user: User, _body: dict, project: str) -> dict:
@@ -1221,8 +1482,17 @@ def api_restart_session(cfg: dict, _user: User, body: dict, key: str) -> dict:
 
 
 def api_reconnect(cfg: dict, _user: User, _body: dict, session_id: str) -> dict:
-    sid = f"session_{short_id(session_id)}"
-    return {"message": reconnect_session(cfg, find_bridge_worktree(cfg, sid), sid)}
+    return {"message": reconnect(cfg, session_id)}
+
+
+def api_reconnect_all(cfg: dict, _user: User, _body: dict) -> dict:
+    results = reconnect_all(cfg)
+    if not results:
+        raise CrpmError("no sessions were interrupted by the last restart")
+    up = sum(x["connected"] for x in results)
+    bad = [f"{x['name'] or x['session_id']}: {x['message']}" for x in results if not x["ok"]]
+    msg = f"reconnected {up} of {len(results)} session(s)" + ("".join("\n" + b for b in bad))
+    return {"message": msg, "results": results}
 
 
 WEB_ROUTES = [
@@ -1234,6 +1504,7 @@ WEB_ROUTES = [
     ("POST", r"/api/sessions", api_new_session),
     ("POST", r"/api/sessions/([^/]+)/restart", api_restart_session),
     ("POST", r"/api/sessions/([^/]+)/reconnect", api_reconnect),
+    ("POST", r"/api/reconnect-all", api_reconnect_all),
 ]
 
 PAGE_HEADERS = {
@@ -1364,9 +1635,12 @@ def main(argv=None) -> int:
     sub.add_parser("daemon")
     sub.add_parser("status")
     sub.add_parser("stop-all")
-    rc = sub.add_parser("reconnect", help="serve a spawned session again after its server stopped")
+    rc = sub.add_parser("reconnect", help="bring stopped sessions back on Remote Control (e.g. after a reboot)")
     rc.add_argument("session_id", nargs="?", metavar="SESSION_ID",
-                    help="session_..., cse_..., or the bare ID (default: the session worktree you're in)")
+                    help="session_..., cse_..., or the bare ID (default: the session that ran in this folder)")
+    rc.add_argument("--all", action="store_true", help="every session that was running at the last restart")
+    rc.add_argument("--list", action="store_true", help="list sessions that can be reconnected")
+    rc.add_argument("--dry-run", action="store_true", help="with --all: only show what would be reconnected")
     rs = sub.add_parser("restart-session", help="restart idle sessions so they load new config")
     rs.add_argument("ids", nargs="*", metavar="SESSION_ID",
                     help="session_..., cse_..., or the bare ID (default: sessions in the current folder)")

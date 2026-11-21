@@ -78,6 +78,8 @@ button.small, .btn.small { font-size: 13px; padding: 5px 10px; min-height: 30px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 .banner { margin: 14px 0 0; padding: 10px 12px; border-radius: var(--radius); background: var(--bad-soft); color: var(--bad); }
+.banner.warn { background: var(--warn-soft); color: var(--warn); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.banner.warn span { flex: 1 1 220px; }
 .list { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
 .section-title { margin: 22px 0 4px; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
 details.proj { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
@@ -320,7 +322,7 @@ function serverBadge(p) {
   return h("span", { class: "badge", text: s.state });
 }
 const needsTrust = (p) => p.server && p.server.state === "WAITING FOR TRUST PROMPT";
-const attention = (p) => needsTrust(p) || (p.server && p.server.dead);
+const attention = (p) => needsTrust(p) || (p.server && p.server.dead) || p.reconnectable.some((r) => r.interrupted);
 function ago(ts) {
   const s = Math.max(0, Date.now() / 1000 - ts);
   if (s < 90) return "just now";
@@ -405,14 +407,17 @@ function projectCard(p) {
   else body.append(h("div", { class: "empty", text: "No sessions running." }));
 
   if (p.reconnectable.length) {
-    const rec = h("details", { class: "recover", open: open.has("recover:" + p.name) },
-      h("summary", { text: `Recover sessions whose server stopped (${p.reconnectable.length})` }),
-      h("div", { class: "hint", style: "margin:6px 0", text: "Claude Code can reattach a session for about 4 hours after its server stopped." }),
+    const cut = p.reconnectable.filter((r) => r.interrupted).length;
+    const rec = h("details", { class: "recover", open: cut > 0 || open.has("recover:" + p.name) },
+      h("summary", { text: cut ? `Stopped by the restart (${cut})` + (p.reconnectable.length > cut ? `, and ${p.reconnectable.length - cut} more` : "")
+                               : `Recover sessions whose server stopped (${p.reconnectable.length})` }),
+      h("div", { class: "hint", style: "margin:6px 0", text: "Sessions from the app can be reattached for about 4 hours after they stopped; terminal sessions resume their conversation any time." }),
       p.reconnectable.map((r) => h("div", { class: "sess" },
         h("span", { class: "dot local" }),
         h("div", { class: "sinfo" },
-          h("div", { class: "sname mono", text: r.session_id }),
-          h("div", { class: "ssub", text: "last active " + ago(r.last_active) })),
+          h("div", { class: "sname" + (r.name ? "" : " mono"), text: r.name || r.session_id }),
+          h("div", { class: "ssub", text: (r.interrupted ? "stopped by the restart" : "last active " + ago(r.last_active))
+            + (r.name ? " · " + r.session_id : "") })),
         h("div", { class: "sact" },
           btn("c:" + r.session_id, "Reconnect", () => act("c:" + r.session_id, "Reconnecting…",
             () => api("POST", `/api/sessions/${encodeURIComponent(r.session_id)}/reconnect`)), "small")))));
@@ -544,6 +549,10 @@ function render() {
       h("div", { class: "tools" }, filterInput,
         h("button", { class: "primary", disabled: !state, onclick: () => openNew(), text: "New session" }))),
     loadError ? h("div", { class: "banner", text: "Can't reach crpm: " + loadError }) : null,
+    state && state.interrupted ? h("div", { class: "banner warn" },
+      h("span", { text: `${state.interrupted} session${state.interrupted > 1 ? "s were" : " was"} running when this machine restarted.` }),
+      btn("reconnect-all", "Reconnect all", () => act("reconnect-all", "Reconnecting…",
+        () => api("POST", "/api/reconnect-all")), "attn small")) : null,
     !state ? h("div", { class: "empty", style: "padding:24px 0", text: loadError ? "" : "Loading…" }) : [
       active.length ? h("div", { class: "section-title", text: "Active" }) : null,
       h("div", { class: "list" }, active.map(projectCard)),
