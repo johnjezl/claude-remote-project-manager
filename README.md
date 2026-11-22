@@ -39,7 +39,10 @@ claude.ai/code or the Claude mobile app.
   that was running, at its same claude.ai link. Sessions started in a terminal or with
   `crpm new-session` resume their conversation. Sessions opened from the app are reattached,
   which Claude Code allows for about 4 hours after they stopped. Sessions you closed
-  yourself are not brought back.
+  yourself are not brought back. If the daemon was stopped when the machine went down,
+  crpm can't tell which sessions were still running, so it offers none; reconnect them by ID.
+  A session whose reconnect fails stops counting as waiting; `crpm reconnect --dismiss`
+  (or **Dismiss**) stops offering the rest.
 
 ## Install
 
@@ -59,6 +62,7 @@ crpm sessions [PROJECT]         # running sessions and their session IDs (defaul
                                 #   else all; --ids for IDs only, --json for details, --remote for RC only)
 crpm reconnect --all            # after a reboot: bring back every session that was running
 crpm reconnect --list           # sessions that can be reconnected (--all --dry-run: just the interrupted ones)
+crpm reconnect --dismiss [ID]   # stop offering a session (no ID: every interrupted one)
 crpm reconnect [SESSION_ID]     # bring one session back (no ID: the session that ran in this folder)
 crpm new-session PROJECT ["first message"] [-n NAME] [--here]
                                 # new Remote Control session in its own worktree; prints its claude.ai link
