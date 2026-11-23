@@ -33,6 +33,18 @@ claude.ai/code or the Claude mobile app.
 * **Survives restarts.** Stopping or restarting the service only stops the daemon.
   The tmux server keeps running and the daemon picks the sessions back up when it
   starts. `crpm stop-all` tears them down.
+* **Recovers from reboots.** A reboot ends every session. The daemon keeps a list of
+  the Remote Control sessions it sees (`~/.local/state/crpm/sessions.json`), so afterwards
+  `crpm reconnect --all` (or **Reconnect all** in the dashboard) brings back every session
+  that was running, at its same claude.ai link. Sessions started in a terminal or with
+  `crpm new-session` resume their conversation. Sessions opened from the app are reattached,
+  which Claude Code allows for about 4 hours after they stopped. Sessions you closed
+  yourself are not brought back. If the daemon was stopped when the machine went down,
+  crpm can't tell which sessions were still running, so it offers none; reconnect them by ID.
+  The same goes for a machine that was off for more than 15 minutes, if its journal doesn't
+  keep earlier boots (`Storage=volatile`): crpm can't rule out a boot it missed in between.
+  A session whose reconnect fails stops counting as waiting; `crpm reconnect --dismiss`
+  (or **Dismiss**) stops offering the rest.
 
 ## Install
 
@@ -50,8 +62,10 @@ crpm attach sd-mux              # watch or answer a project's remote-control TUI
 crpm restart sd-mux             # bounce one project
 crpm sessions [PROJECT]         # running sessions and their session IDs (default: the project you're in,
                                 #   else all; --ids for IDs only, --json for details, --remote for RC only)
-crpm reconnect [SESSION_ID]     # bring a session back in tmux after its server stopped
-                                #   (no ID: the session whose worktree you're in)
+crpm reconnect --all            # after a reboot: bring back every session that was running
+crpm reconnect --list           # sessions that can be reconnected (--all --dry-run: just the interrupted ones)
+crpm reconnect --dismiss [ID]   # stop offering a session (no ID: every interrupted one)
+crpm reconnect [SESSION_ID]     # bring one session back (no ID: the session that ran in this folder)
 crpm new-session PROJECT ["first message"] [-n NAME] [--here]
                                 # new Remote Control session in its own worktree; prints its claude.ai link
 crpm restart-session [ID...]    # restart idle sessions to load new settings/MCP servers/etc.
@@ -72,7 +86,8 @@ from any browser, including your phone:
 * **New session**: pick a project, type the first message, get the claude.ai link
 * **Trust** a project waiting on its first-run trust prompt, without `crpm attach`
 * restart a project's server, restart a session (or put a local session on Remote Control),
-  reconnect a session whose server stopped, view a server's screen and last exit log
+  reconnect a session whose server stopped (or **Reconnect all** after a reboot), view a server's
+  screen and last exit log
 
 **Logging in.** `install.sh` prints a login link the first time. `crpm web-token` makes a new one
 (and invalidates the old one); the token is in the link's `#fragment`, so it never reaches server
