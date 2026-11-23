@@ -41,6 +41,8 @@ claude.ai/code or the Claude mobile app.
   which Claude Code allows for about 4 hours after they stopped. Sessions you closed
   yourself are not brought back. If the daemon was stopped when the machine went down,
   crpm can't tell which sessions were still running, so it offers none; reconnect them by ID.
+  The same goes for a machine that was off for more than 15 minutes, if its journal doesn't
+  keep earlier boots (`Storage=volatile`): crpm can't rule out a boot it missed in between.
   A session whose reconnect fails stops counting as waiting; `crpm reconnect --dismiss`
   (or **Dismiss**) stops offering the rest.
 

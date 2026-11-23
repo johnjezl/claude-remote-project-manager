@@ -27,6 +27,7 @@ import contextlib
 import fcntl
 import fnmatch
 import getpass
+import glob
 import hashlib
 import json
 import logging
@@ -460,9 +461,9 @@ class Manager:
                 time.sleep(0.1)
         # From now on sessions can end unseen. If this stop is the shutdown, the sessions running now
         # were interrupted; if not, and the machine restarts before the daemon is back, none can be
-        # called interrupted. last_restart decides which, from the journal (or systemctl's answer now).
-        self.registry["stopped"][boot] = {"at": time.time(),
-                                          "shutdown": journal_boots() is None and system_stopping()}
+        # called interrupted. last_restart decides which: from the journal if it keeps this boot,
+        # else from systemctl's answer now. (A journal kept in memory loses this boot at the reboot.)
+        self.registry["stopped"][boot] = {"at": time.time(), "shutdown": system_stopping()}
         try:
             save_registry(self.cfg, self.registry)
         except OSError as e:
@@ -1027,6 +1028,8 @@ REGISTRY_HEARTBEAT = 15.0       # seconds between registry writes when nothing c
 SHUTDOWN_GRACE = 15.0           # sessions that ended this close to the daemon's last look died with the boot
 STOP_NEAR_END = 300.0           # a daemon stop this close to its boot's last journal entry was the shutdown
 BOOTS_KEEP = 5                  # recent boots remembered even if no session ran in them
+BOOT_GAP = 15 * 60              # without the journal: the daemon's last look at the previous boot must be
+                                # this close to this boot's start, or a boot without the daemon may lie between
 REATTACH_WINDOW = 6 * 3600      # Claude Code reattaches app sessions for about 4h after they stop
 
 # Flags of an interactive session that resuming it keeps. Everything else is dropped: --resume,
@@ -1219,24 +1222,42 @@ def journal_boots() -> list[tuple[str, float]] | None:
     return _journal_boots or None
 
 
+def boot_time() -> float | None:
+    """When this boot started (btime in /proc/stat)."""
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def last_restart(reg: dict, boot: str) -> tuple[str, float] | None:
     """(previous boot, the last moment the daemon saw it) if the daemon watched that boot to its end;
     None if there is no previous boot, the daemon didn't run in it, or it was stopped well before
     the boot ended (then sessions could end unseen, so none can be called interrupted)."""
     jb, end = journal_boots(), None
     ids = [b for b, _ in jb or []]
-    if norm_boot(boot) in ids and ids.index(norm_boot(boot)) > 0:
+    if norm_boot(boot) in ids and ids.index(norm_boot(boot)) > 0:  # the journal knows the previous boot
         prev_id, end = jb[ids.index(norm_boot(boot)) - 1]
         prev = next((b for b in reg["boots"] if norm_boot(b) == prev_id), None)
         if prev is None:
             return None  # the daemon never ran in the previous boot
-    else:  # no persistent journal: go by the boots the registry knows
+    else:  # the journal doesn't keep earlier boots: go by the boots the registry knows
         prev = previous_boot(reg, boot)
         if prev is None:
             return None
     stop = reg.get("stopped", {}).get(prev)
+    last = stop["at"] if stop else reg["boots"][prev]  # no stop recorded: power loss or crash
+    if end is None:
+        # Nothing confirms that `prev` was the boot right before this one; the daemon may have missed
+        # one. Only trust it if this boot started soon after the daemon's last look at `prev`.
+        start = boot_time()
+        if start is None or not -60 <= start - last <= BOOT_GAP:
+            return None
     if not stop:
-        return prev, reg["boots"][prev]  # watched it to the end (power loss or crash: no stop recorded)
+        return prev, last  # watched it to the end
     part_of_shutdown = end - stop["at"] <= STOP_NEAR_END if end is not None else stop.get("shutdown", True)
     return (prev, stop["at"]) if part_of_shutdown else None
 
@@ -1250,7 +1271,7 @@ def interrupted(reg: dict, e: dict, boot: str) -> bool:
 
 
 def system_stopping() -> bool:
-    """Is the machine shutting down? Only asked when the journal can't tell afterwards. Anything but
+    """Is the machine shutting down? Only used if the journal can't tell afterwards. Anything but
     a clear "the system is up" counts as shutting down: offering a session that was closed is easier
     to undo (Dismiss) than not offering one that was running."""
     try:
@@ -1263,9 +1284,12 @@ def system_stopping() -> bool:
 def resume_terminal(cfg: dict, e: dict) -> str:
     """Resume an interactive session's conversation, Remote Control on, in a detached tmux session."""
     sid, cwd, conv = e["session_id"], Path(e["cwd"]), e.get("conversation") or ""
-    transcript = claude_config_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd)) / f"{conv}.jsonl"
-    if not conv or not transcript.exists():
-        raise CrpmError(f"its conversation's transcript ({transcript}) is gone, so there is nothing to resume")
+    projects = claude_config_dir() / "projects"
+    transcript = projects / re.sub(r"[^A-Za-z0-9]", "-", str(cwd)) / f"{conv}.jsonl"
+    # Claude Code shortens long folder names, so look for the conversation in any project folder too.
+    if not conv or not (transcript.exists() or any(projects.glob(f"*/{glob.escape(conv)}.jsonl"))):
+        raise CrpmError(f"its conversation's transcript ({conv or '?'}.jsonl under {projects}) is gone, "
+                        "so there is nothing to resume")
     flags = e.get("flags") or {}
     rc_name = flags.get("rc_name") or e.get("name") or cwd.name
     argv = [cfg["claude_bin"], "--resume", conv, *flags.get("args", []), f"--remote-control={rc_name}"]
@@ -1285,12 +1309,18 @@ def reconnect(cfg: dict, session_id: str) -> str:
     try:
         return _reconnect(cfg, sid)
     except Exception as err:
-        if not isinstance(err, AlreadyRunning):
+        if not isinstance(err, AlreadyRunning) and known_session(cfg, sid):  # not for a mistyped ID
             try:
                 mark_reconnect(cfg, [sid], failed=str(err) or type(err).__name__)
             except OSError:
                 pass
         raise
+
+
+def known_session(cfg: dict, sid: str) -> bool:
+    """Is this a session crpm could offer: in the registry, or a spawned session's worktree?"""
+    return sid in load_registry(cfg)["sessions"] or \
+        any(cfg["projects_dir"].glob(f"*/.claude/worktrees/bridge-cse_{short_id(sid)}"))
 
 
 def _reconnect(cfg: dict, sid: str) -> str:
@@ -1370,6 +1400,8 @@ def cmd_restart(cfg: dict, a) -> int:
 def cmd_reconnect(cfg: dict, a) -> int:
     if a.dry_run and not a.all:
         raise CrpmError("--dry-run only goes with --all (to see everything, use --list)")
+    if a.session_id and (a.all or a.list):
+        raise CrpmError("give a session ID or --all/--list, not both")
     if a.dismiss:
         sids = dismiss(cfg, [a.session_id] if a.session_id else None)
         print(f"dismissed {len(sids)} session(s)" if sids else "no interrupted sessions to dismiss")
@@ -1416,12 +1448,21 @@ def cmd_reconnect(cfg: dict, a) -> int:
     if found:
         print(reconnect(cfg, found[1]))
         return 0
-    here = [r for r in reconnect_candidates(cfg) if Path(r.worktree) == Path.cwd().resolve()]
+    here = sessions_here(reconnect_candidates(cfg), Path.cwd())
     if len(here) == 1:
         print(reconnect(cfg, here[0].session_id))
         return 0
     raise CrpmError("pass a session ID (see crpm reconnect --list), --all, or run this from the folder "
                     "of the session to bring back" + (f" ({len(here)} stopped sessions ran here)" if here else ""))
+
+
+def sessions_here(found: list[Reconnectable], cwd: Path) -> list[Reconnectable]:
+    """The sessions that ran in `cwd` or the nearest folder above it that any session ran in."""
+    cwd = cwd.resolve()
+    hits = [(len(p.parts), r) for r in found
+            for p in [Path(r.worktree).resolve()] if p == cwd or p in cwd.parents]
+    deepest = max((n for n, _ in hits), default=0)
+    return [r for n, r in hits if n == deepest]
 
 
 def ago(t: float) -> str:
